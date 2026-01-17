@@ -74,7 +74,7 @@ gst_amlvenc_add_v_chroma_format (GstAmlVEnc *encoder, GstStructure * s)
 #define PROP_IDR_PERIOD_DEFAULT 30
 #define PROP_FRAMERATE_DEFAULT 30
 #define PROP_BITRATE_DEFAULT 2000
-#define PROP_BITRATE_MAX 12000
+#define PROP_BITRATE_MAX G_MAXINT  /* Removed 12Mbps limit - encoder can handle 300Mbps+ */
 #define PROP_MIN_BUFFERS_DEFAULT 2
 #define PROP_MAX_BUFFERS_DEFAULT 6
 #define PROP_ENCODER_BUFFER_SIZE_DEFAULT 2048
