@@ -93,6 +93,12 @@ gst_amlvenc_add_v_chroma_format (GstAmlVEnc *encoder, GstStructure * s)
 #define PROP_ROI_X_DEFAULT 0.00
 #define PROP_ROI_Y_DEFAULT 0.00
 #define PROP_ROI_QUALITY_DEFAULT 51
+
+#define PROP_INTERNAL_BIT_DEPTH_DEFAULT 8
+#define PROP_GOP_PATTERN_DEFAULT 0
+#define PROP_RC_MODE_DEFAULT 0
+#define PROP_LOSSLESS_ENABLE_DEFAULT FALSE
+
 #define DRMBP_EXTRA_BUF_SIZE_FOR_DISPLAY 1
 #define DRMBP_LIMIT_MAX_BUFSIZE_TO_BUFSIZE 1
 
@@ -112,6 +118,10 @@ enum
   PROP_ROI_X,
   PROP_ROI_Y,
   PROP_ROI_QUALITY,
+  PROP_INTERNAL_BIT_DEPTH,
+  PROP_GOP_PATTERN,
+  PROP_RC_MODE,
+  PROP_LOSSLESS_ENABLE,
   PROD_ENABLE_DMALLOCATOR
 };
 
@@ -450,6 +460,26 @@ gst_amlvenc_class_init (GstAmlVEncClass * klass)
           0, 51, PROP_ROI_QUALITY_DEFAULT,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_INTERNAL_BIT_DEPTH,
+      g_param_spec_int("internal-bit-depth", "internal-bit-depth", "Encoder internal bit depth (8 or 10)",
+          8, 10, PROP_INTERNAL_BIT_DEPTH_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_GOP_PATTERN,
+      g_param_spec_int("gop-pattern", "gop-pattern", "GOP structure pattern (0=IP, 1=IBBBP, 2=IBPBP, 3=ALL_I)",
+          0, 4, PROP_GOP_PATTERN_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_RC_MODE,
+      g_param_spec_int("rc-mode", "rc-mode", "Rate control mode (0=VBR, 1=CBR, 2=CQP)",
+          0, 2, PROP_RC_MODE_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_LOSSLESS_ENABLE,
+      g_param_spec_boolean("lossless-enable", "lossless-enable", "Enable lossless encoding (HEVC only - disables rate control, NR, ROI)",
+          PROP_LOSSLESS_ENABLE_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   g_object_class_install_property (gobject_class, PROD_ENABLE_DMALLOCATOR,
       g_param_spec_boolean ("enable-dmallocator", "enable-dmallocator", "Enable/Disable dmallocator",
           FALSE,
@@ -492,6 +522,10 @@ gst_amlvenc_init (GstAmlVEnc * encoder)
   encoder->min_buffers = PROP_MIN_BUFFERS_DEFAULT;
   encoder->encoder_bufsize = PROP_ENCODER_BUFFER_SIZE_DEFAULT * 1024;
   encoder->codec.id = CODEC_ID_NONE;
+  encoder->internal_bit_depth = PROP_INTERNAL_BIT_DEPTH_DEFAULT;
+  encoder->gop_pattern = PROP_GOP_PATTERN_DEFAULT;
+  encoder->rc_mode = PROP_RC_MODE_DEFAULT;
+  encoder->lossless_enable = PROP_LOSSLESS_ENABLE_DEFAULT;
 
   list_init(&encoder->roi.param_info);
   encoder->roi.srcid = 0;
@@ -627,6 +661,10 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encode_info.img_format = img_format_convert(GST_VIDEO_INFO_FORMAT(info));
   encode_info.prepend_spspps_to_idr_frames = TRUE;
   encode_info.enc_feature_opts |= 0x1;  // enable roi function
+  encode_info.internal_bit_depth = encoder->internal_bit_depth;
+  encode_info.gop_pattern = encoder->gop_pattern;
+  encode_info.rc_mode = encoder->rc_mode;
+  encode_info.lossless_enable = encoder->lossless_enable;
 
   qp_param_t qp_tbl;
   memset(&qp_tbl, 0, sizeof(qp_param_t));
@@ -976,6 +1014,11 @@ gst_amlvenc_set_format (GstVideoEncoder * video_enc,
   }
 
   gst_caps_unref (template_caps);
+
+  if (encoder->lossless_enable && encoder->codec.id == CODEC_ID_H264) {
+    GST_ERROR_OBJECT (encoder, "lossless-enable is HEVC-only feature, not supported for H.264");
+    return FALSE;
+  }
 
   // init roi buffer info
   if (encoder->codec.id == CODEC_ID_H265) {
@@ -1380,6 +1423,18 @@ gst_amlvenc_get_property (GObject * object, guint prop_id,
       struct RoiParamInfo *param_info = retrieve_roi_param_info(encoder, encoder->roi.id);
       g_value_set_int (value, param_info->quality);
     } break;
+    case PROP_INTERNAL_BIT_DEPTH:
+      g_value_set_int (value, encoder->internal_bit_depth);
+      break;
+    case PROP_GOP_PATTERN:
+      g_value_set_int (value, encoder->gop_pattern);
+      break;
+    case PROP_RC_MODE:
+      g_value_set_int (value, encoder->rc_mode);
+      break;
+    case PROP_LOSSLESS_ENABLE:
+      g_value_set_boolean (value, encoder->lossless_enable);
+      break;
     case PROD_ENABLE_DMALLOCATOR:
       g_value_set_boolean (value, encoder->b_enable_dmallocator);
       break;
@@ -1461,6 +1516,18 @@ gst_amlvenc_set_property (GObject * object, guint prop_id,
         roi_set_flag = true;
       }
     } break;
+    case PROP_INTERNAL_BIT_DEPTH:
+      encoder->internal_bit_depth = g_value_get_int (value);
+      break;
+    case PROP_GOP_PATTERN:
+      encoder->gop_pattern = g_value_get_int (value);
+      break;
+    case PROP_RC_MODE:
+      encoder->rc_mode = g_value_get_int (value);
+      break;
+    case PROP_LOSSLESS_ENABLE:
+      encoder->lossless_enable = g_value_get_boolean (value);
+      break;
     case PROD_ENABLE_DMALLOCATOR: {
       gboolean enabled = g_value_get_boolean (value);
       encoder->b_enable_dmallocator = enabled;

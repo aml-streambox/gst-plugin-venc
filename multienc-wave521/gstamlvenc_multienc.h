@@ -75,6 +75,12 @@ struct _GstAmlVEnc
   guint u4_first_pts_index;
   gboolean b_enable_dmallocator;
 
+  /* advanced encoding properties */
+  gint internal_bit_depth;
+  gint gop_pattern;
+  gint rc_mode;
+  gboolean lossless_enable;
+
   struct roi_info {
     guint srcid;
     gboolean enabled;
