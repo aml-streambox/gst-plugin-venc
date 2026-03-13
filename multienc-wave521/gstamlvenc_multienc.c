@@ -63,6 +63,8 @@ gst_amlvenc_add_v_chroma_format (GstAmlVEnc *encoder, GstStructure * s)
   gst_value_list_append_value (&fmts, &fmt);
   g_value_set_string (&fmt, "BGR");
   gst_value_list_append_value (&fmts, &fmt);
+  g_value_set_string (&fmt, "P010_10LE");
+  gst_value_list_append_value (&fmts, &fmt);
 
   if (gst_value_list_get_size (&fmts) != 0) {
     gst_structure_take_value (s, "format", &fmts);
@@ -206,6 +208,9 @@ img_format_convert (GstVideoFormat vfmt) {
   case GST_VIDEO_FORMAT_BGR:
     // use ge2d for internal conversation
     fmt = IMG_FMT_NV12;
+    break;
+  case GST_VIDEO_FORMAT_P010_10LE:
+    fmt = IMG_FMT_P010;
     break;
   default:
     fmt = IMG_FMT_NONE;
@@ -1197,22 +1202,31 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
   vl_buffer_info_t retbuf_info;
 
   GstMemory *memory = gst_buffer_get_memory(frame->input_buffer, 0);
+  guint n_mem = gst_buffer_n_memory (frame->input_buffer);
   gboolean is_dmabuf = gst_is_dmabuf_memory(memory);
   GstMapInfo minfo;
+  encoder->fd[0] = -1;
+  encoder->fd[1] = -1;
+  encoder->fd[2] = -1;
   GST_DEBUG_OBJECT(encoder, "is_dmabuf[%d] width[%d] height[%d]",is_dmabuf,info->width,info->height);
 
   if (is_dmabuf) {
       switch (GST_VIDEO_INFO_FORMAT(info)) {
       case GST_VIDEO_FORMAT_NV12:
       case GST_VIDEO_FORMAT_NV21:
+      case GST_VIDEO_FORMAT_P010_10LE:
           {
           /* handle dma case scenario media convet encoder/hdmi rx encoder scenario*/
           encoder->fd[0] = gst_dmabuf_memory_get_fd(memory);
           gst_memory_unref(memory);
-          GstMemory *memory_uv = gst_buffer_get_memory(frame->input_buffer, 1);
-          encoder->fd[1] = gst_dmabuf_memory_get_fd(memory_uv);
-          gst_memory_unref(memory_uv);
-          ui1_plane_num = 2;
+          if (n_mem >= 2) {
+            GstMemory *memory_uv = gst_buffer_get_memory(frame->input_buffer, 1);
+            encoder->fd[1] = gst_dmabuf_memory_get_fd(memory_uv);
+            gst_memory_unref(memory_uv);
+            ui1_plane_num = 2;
+          } else {
+            ui1_plane_num = 1;
+          }
           break;
           }
       default: //hanle I420/YV12/RGB
@@ -1299,10 +1313,20 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
 
   memset(&inbuf_info, 0, sizeof(vl_buffer_info_t));
   inbuf_info.buf_type = DMA_TYPE;
+  inbuf_info.buf_fmt = img_format_convert (GST_VIDEO_INFO_FORMAT (info));
+  inbuf_info.buf_stride = GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
+  if (inbuf_info.buf_stride <= 0)
+    inbuf_info.buf_stride = info->width;
   inbuf_info.buf_info.dma_info.shared_fd[0] = encoder->fd[0];
   inbuf_info.buf_info.dma_info.shared_fd[1] = encoder->fd[1];
   inbuf_info.buf_info.dma_info.shared_fd[2] = encoder->fd[2];
   inbuf_info.buf_info.dma_info.num_planes = ui1_plane_num;
+  GST_DEBUG_OBJECT (encoder,
+      "submit inbuf: fmt=%d stride=%d planes=%d fd0=%d fd1=%d",
+      inbuf_info.buf_fmt, inbuf_info.buf_stride,
+      inbuf_info.buf_info.dma_info.num_planes,
+      inbuf_info.buf_info.dma_info.shared_fd[0],
+      inbuf_info.buf_info.dma_info.shared_fd[1]);
 
   encoding_metadata_t meta =
       vl_multi_encoder_encode(encoder->codec.handle, frame_type,

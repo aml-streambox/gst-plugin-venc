@@ -58,6 +58,8 @@ gst_amlvenc_add_v_chroma_format (GstAmlVEnc *encoder, GstStructure * s)
   gst_value_list_append_value (&fmts, &fmt);
   g_value_set_string (&fmt, "BGR");
   gst_value_list_append_value (&fmts, &fmt);
+  g_value_set_string (&fmt, "P010_10LE");
+  gst_value_list_append_value (&fmts, &fmt);
 
   if (gst_value_list_get_size (&fmts) != 0) {
     gst_structure_take_value (s, "format", &fmts);
@@ -1056,6 +1058,7 @@ static GstFlowReturn gst_amlvenc_encode_frame (GstAmlVEnc * encoder, GstVideoCod
             switch (GST_VIDEO_INFO_FORMAT(info)) {
                 case GST_VIDEO_FORMAT_NV12:
                 case GST_VIDEO_FORMAT_NV21:
+                case GST_VIDEO_FORMAT_P010_10LE:
                     pixel = GST_VIDEO_FRAME_PLANE_DATA (&video_frame, 1);
                     inbuf_info.buf_info.in_ptr[1] = (ulong) (pixel);
                     break;
