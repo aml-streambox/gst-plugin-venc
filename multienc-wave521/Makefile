@@ -19,14 +19,15 @@ LDFLAGS += $(shell $(PKG_CONFIG) --libs gstreamer-1.0 gstreamer-base-1.0 gstream
 LDFLAGS += -L$(STAGING_DIR)/usr/lib/ -lion -lvpcodec -lgstdrmbufferpool -lgstdrmallocator
 CFLAGS += \
 	-I$(STAGING_DIR)/usr/include/ \
-    -I$(LOCAL_PATH)/../common/
+	-I$(LOCAL_PATH)/../common/ \
+	-I$(LOCAL_PATH)
 
 
 # build
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
-	$(CC) $^ $(LDFLAGS) -shared -o $@
+	$(CC) $^ $(LDFLAGS) -L$(STAGING_DIR)/usr/lib -lGLESv2 -lEGL -lwayland-egl -lwayland-client -shared -o $@
 
 %.o: %.c
 	$(CC) -c $(CFLAGS) $^ -o $@

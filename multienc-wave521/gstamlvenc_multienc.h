@@ -9,6 +9,7 @@
 #define __GST_AMLVENC_H__
 
 #include <gst/gst.h>
+#include <gst/gstallocator.h>
 #include <gst/video/video.h>
 #include <gst/video/gstvideoencoder.h>
 //#include <list.h>
@@ -61,6 +62,15 @@ struct _GstAmlVEnc
       gint fd;
     } input, output;
   } imgproc;
+
+  struct v10conv_info {
+    gboolean enabled;
+    GstAllocator *allocator;
+    struct {
+      GstMemory *memory;
+      gint fd;
+    } output_y, output_uv;
+  } v10conv;
 
   GstAllocator *dmabuf_alloc;
 
