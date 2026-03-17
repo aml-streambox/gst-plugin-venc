@@ -1424,26 +1424,11 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
         GST_ERROR_OBJECT (encoder, "failed to prepare internal v10 conversion buffers");
         return GST_FLOW_ERROR;
       }
-      /* Dup output fd so we own it independently of GstMemory lifecycle.
-       * This prevents "Bad file descriptor" when buffer pool reclaims GstMemory.
-       */
-      if (encoder->v10conv.output_y.fd_dup >= 0) {
-        close(encoder->v10conv.output_y.fd_dup);
-      }
-      encoder->v10conv.output_y.fd_dup = dup(encoder->v10conv.output_y.fd);
-      if (encoder->v10conv.output_y.fd_dup < 0) {
-        GST_ERROR_OBJECT(encoder, "failed to dup output fd: %s", strerror(errno));
-        return GST_FLOW_ERROR;
-      }
-      GST_WARNING_OBJECT(encoder, "dup'd output fd: original=%d dup=%d",
-          encoder->v10conv.output_y.fd, encoder->v10conv.output_y.fd_dup);
-      
       /* Use selected backend: 0=vulkan (default), 1=gles */
       gint64 t_conv_start = g_get_monotonic_time();
-      int conv_result = -1;
       
       if (encoder->v10conv_backend == 0) {
-        /* Vulkan backend (default) */
+        /* Vulkan backend (default) — uses cached dmabuf imports internally */
         static gboolean vulkan_initialized = FALSE;
         if (!vulkan_initialized) {
           if (yuv422_vulkan_init(info->width, info->height) == 0) {
@@ -1452,43 +1437,28 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
           } else {
             GST_ERROR_OBJECT(encoder, "Vulkan init failed (%s)",
                 yuv422_vulkan_last_error());
-            close(encoder->v10conv.output_y.fd_dup);
-            encoder->v10conv.output_y.fd_dup = -1;
             return GST_FLOW_ERROR;
           }
         }
         
-        /* Validate fd before Vulkan conversion */
-        struct stat st;
-        if (fstat(encoder->v10conv.output_y.fd_dup, &st) < 0) {
-          GST_ERROR_OBJECT(encoder, "fd_dup %d invalid before Vulkan: %s",
-              encoder->v10conv.output_y.fd_dup, strerror(errno));
-          close(encoder->v10conv.output_y.fd_dup);
-          encoder->v10conv.output_y.fd_dup = -1;
-          return GST_FLOW_ERROR;
-        }
-        GST_WARNING_OBJECT(encoder, "fd_dup %d valid before Vulkan", encoder->v10conv.output_y.fd_dup);
-        
-        /* Use dup'd fd - Vulkan will dup it again internally */
-        conv_result = yuv422_vulkan_convert_dmabuf(in_fd,
-            encoder->v10conv.output_y.fd_dup, info->width, info->height);
-        if (conv_result != 0) {
+        /* Pass original fds — Vulkan caches imports and dup()s internally */
+        if (yuv422_vulkan_convert_dmabuf(in_fd,
+                encoder->v10conv.output_y.fd,
+                info->width, info->height) != 0) {
           GST_ERROR_OBJECT(encoder, "Vulkan conversion failed (%s)",
               yuv422_vulkan_last_error());
           return GST_FLOW_ERROR;
         }
-        
-        /* Validate fd after Vulkan conversion */
-        if (fstat(encoder->v10conv.output_y.fd_dup, &st) < 0) {
-          GST_ERROR_OBJECT(encoder, "fd_dup %d invalid AFTER Vulkan: %s",
-              encoder->v10conv.output_y.fd_dup, strerror(errno));
-        } else {
-          GST_WARNING_OBJECT(encoder, "fd_dup %d still valid after Vulkan (size=%ld)", 
-              encoder->v10conv.output_y.fd_dup, (long)st.st_size);
-        }
-        GST_WARNING_OBJECT(encoder, "Vulkan conversion succeeded");
       } else {
-        /* GLES backend - also use dup'd fd */
+        /* GLES backend */
+        if (encoder->v10conv.output_y.fd_dup >= 0) {
+          close(encoder->v10conv.output_y.fd_dup);
+        }
+        encoder->v10conv.output_y.fd_dup = dup(encoder->v10conv.output_y.fd);
+        if (encoder->v10conv.output_y.fd_dup < 0) {
+          GST_ERROR_OBJECT(encoder, "failed to dup output fd: %s", strerror(errno));
+          return GST_FLOW_ERROR;
+        }
         if (yuv422_gpu_gles_convert_p010_dmabuf (in_fd,
                 encoder->v10conv.output_y.fd_dup,
                 info->width, info->height) != 0) {
@@ -1498,11 +1468,10 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
           encoder->v10conv.output_y.fd_dup = -1;
           return GST_FLOW_ERROR;
         }
-        GST_WARNING_OBJECT(encoder, "GLES conversion succeeded");
       }
       
       gint64 conv_us = g_get_monotonic_time() - t_conv_start;
-      GST_WARNING_OBJECT(encoder, "[ENC-PROF] %s conversion time: %" G_GINT64_FORMAT " us (%.2f ms)",
+      GST_WARNING_OBJECT(encoder, "[ENC-PROF] %s conversion: %" G_GINT64_FORMAT " us (%.2f ms)",
           encoder->v10conv_backend == 0 ? "Vulkan" : "GLES",
           conv_us, conv_us / 1000.0);
 
@@ -1691,14 +1660,9 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
       vl_multi_encoder_encode(encoder->codec.handle, frame_type,
                               encoder->codec.buf, &inbuf_info, &retbuf_info);
 
-  /* Release Vulkan output resources after encoder is done with them */
-  if (encoder->v10conv.enabled && encoder->v10conv_backend == 0) {
-    yuv422_vulkan_release_output();
-  }
-  
-  /* Close dup'd output fd after encoding completes */
-  if (encoder->v10conv.enabled && encoder->v10conv.output_y.fd_dup >= 0) {
-    GST_WARNING_OBJECT(encoder, "closing dup'd output fd: %d", encoder->v10conv.output_y.fd_dup);
+  /* Close GLES dup'd output fd after encoding completes */
+  if (encoder->v10conv.enabled && encoder->v10conv_backend == 1 &&
+      encoder->v10conv.output_y.fd_dup >= 0) {
     close(encoder->v10conv.output_y.fd_dup);
     encoder->v10conv.output_y.fd_dup = -1;
   }

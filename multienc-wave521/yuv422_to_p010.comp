@@ -1,118 +1,122 @@
 #version 450
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int16 : require
-#extension GL_EXT_shader_8bit_storage : require
 #extension GL_EXT_shader_16bit_storage : require
 
 // Vulkan compute shader for YUV422 (40-bit packed) to P010 conversion
-// Each workgroup: 128 threads
-// Each thread: processes 1 pixel pair (2 pixels)
-//
-// P010_10LE format: 10-bit values MSB-aligned in 16-bit little-endian words.
-// On ARM (little-endian), native uint16_t storage is correct — NO byte swap needed.
+// Optimized for Mali-G52 (Bifrost):
+//   - uint32 reads instead of byte reads (2 loads vs 5)
+//   - packed uint32 writes (halves store count)
+//   - no integer divides (2D dispatch eliminates row/col computation)
 
 layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
 
-// Input: 40-bit packed YUV422 format
-// 5 bytes per 2 pixels: [U0(10bits)][Y0(10bits)][V0(10bits)][Y1(10bits)]
+// Input: 40-bit packed YUV422 as uint32 words
 layout(set = 0, binding = 0, std430) readonly buffer InputBuffer {
-    uint8_t data[];
+    uint data[];
 } input_buffer;
 
-// Output Y plane: P010 format, MSB-aligned 10-bit in 16-bit word
+// Output Y plane: packed pairs of uint16 wave-swapped values
 layout(set = 0, binding = 1, std430) writeonly buffer YOutputBuffer {
-    uint16_t data[];
+    uint data[];
 } y_output;
 
-// Output UV plane: P010 format, interleaved U,V, 2x2 subsampled
+// Output UV plane: packed U,V pairs as uint32
 layout(set = 0, binding = 2, std430) writeonly buffer UVOutputBuffer {
-    uint16_t data[];
+    uint data[];
 } uv_output;
 
 // Push constants for dimensions
 layout(push_constant) uniform Params {
     uint width;
     uint height;
+    uint pairs_per_row;  // width / 2 — precomputed on CPU
 } params;
 
 // Wave521 byte-swap format (matches working GLES shader)
-// Input: 10-bit value in bits 9:0 (before MSB alignment)
+// Input: 10-bit value in bits 9:0
 // Output: ((val & 0xFF) << 8) | ((val >> 8) & 0x3)
-// So we skip the << 6 MSB alignment and apply wave swap directly
-uint16_t wave_swap(uint val) {
-    uint swapped = ((val & 0xFFu) << 8) | ((val >> 8) & 0x3u);
-    return uint16_t(swapped);
+uint wave_swap(uint val) {
+    return ((val & 0xFFu) << 8) | ((val >> 8) & 0x3u);
 }
 
 void main() {
-    uint pair_idx = gl_GlobalInvocationID.x;
-    uint total_pairs = params.width * params.height / 2;
-    
-    if (pair_idx >= total_pairs) return;
-    
-    // Each pair = 5 bytes in 40-bit packed format
-    uint byte_offset = pair_idx * 5;
-    
-    // Read 5 bytes
-    uint b0 = uint(input_buffer.data[byte_offset + 0]);
-    uint b1 = uint(input_buffer.data[byte_offset + 1]);
-    uint b2 = uint(input_buffer.data[byte_offset + 2]);
-    uint b3 = uint(input_buffer.data[byte_offset + 3]);
-    uint b4 = uint(input_buffer.data[byte_offset + 4]);
-    
-    // Extract 10-bit components from 40-bit packed format:
-    // Byte layout: [U0-low][U0-high|Y0-low][Y0-high|V0-low][V0-high|Y1-low][Y1-high]
-    //
-    // Bit layout (40 bits across 5 bytes):
-    // b0: U0[7:0]
-    // b1: U0[9:8] | Y0[5:0]
-    // b2: Y0[9:6] | V0[3:0]
-    // b3: V0[9:4] | Y1[1:0]
-    // b4: Y1[9:2]
-    
-    uint u0 = b0 | ((b1 & 0x03) << 8);
-    uint y0 = ((b1 >> 2) & 0x3F) | ((b2 & 0x0F) << 6);
-    uint v0 = ((b2 >> 4) & 0x0F) | ((b3 & 0x3F) << 4);
-    uint y1 = ((b3 >> 6) & 0x03) | (b4 << 2);
-    
-    // Convert to Wave521 format: byte-swap the raw 10-bit values
-    uint16_t y0_p010 = wave_swap(y0);
-    uint16_t y1_p010 = wave_swap(y1);
-    
-    // Write Y plane (2 samples per pair)
-    uint y_idx = pair_idx * 2;
-    y_output.data[y_idx + 0] = y0_p010;
-    y_output.data[y_idx + 1] = y1_p010;
-    
-    // UV plane: 2x2 chroma subsampling
-    // Average U and V from current row and row below
-    uint row = pair_idx / (params.width / 2);
-    uint col = pair_idx % (params.width / 2);
-    
-    // Only process even rows for UV (2x2 block)
-    if ((row & 1) == 0 && row + 1 < params.height) {
-        // Read pair below
-        uint next_offset = byte_offset + (params.width * 5 / 2);
-        uint nb0 = uint(input_buffer.data[next_offset + 0]);
-        uint nb1 = uint(input_buffer.data[next_offset + 1]);
-        uint nb2 = uint(input_buffer.data[next_offset + 2]);
-        uint nb3 = uint(input_buffer.data[next_offset + 3]);
-        
-        uint u1 = nb0 | ((nb1 & 0x03) << 8);
-        uint v1 = ((nb2 >> 4) & 0x0F) | ((nb3 & 0x3F) << 4);
-        
+    // 2D dispatch: x = column (pair within row), y = row
+    // gl_WorkGroupID.y = row, gl_WorkGroupID.x * 128 + gl_LocalInvocationID.x = col
+    uint col = gl_GlobalInvocationID.x;
+    uint row = gl_GlobalInvocationID.y;
+
+    if (col >= params.pairs_per_row || row >= params.height) return;
+
+    uint pair_idx = row * params.pairs_per_row + col;
+
+    // Each pair = 5 bytes starting at byte_offset = pair_idx * 5
+    // Read as uint32 words: word_idx = byte_offset / 4, shift = (byte_offset % 4) * 8
+    uint byte_offset = pair_idx * 5u;
+    uint word_idx = byte_offset >> 2;
+    uint shift = (byte_offset & 3u) << 3;
+
+    // Load 2 (or 3) aligned uint32 words that span our 5 bytes
+    uint w0 = input_buffer.data[word_idx];
+    uint w1 = input_buffer.data[word_idx + 1];
+
+    // Construct 40 contiguous bits from the two words
+    // For shift=0:  lo = w0,        hi = w1
+    // For shift=8:  lo = w0>>8 | w1<<24, hi = w1>>8 | w2<<24
+    // etc.
+    uint lo, hi;
+    if (shift == 0u) {
+        lo = w0;
+        hi = w1;
+    } else {
+        uint w2 = input_buffer.data[word_idx + 2];
+        lo = (w0 >> shift) | (w1 << (32u - shift));
+        hi = (w1 >> shift) | (w2 << (32u - shift));
+    }
+
+    // Extract 10-bit components from 40 contiguous bits in {lo, hi}
+    // Bit layout: [U0(10)][Y0(10)][V0(10)][Y1(10)]
+    uint u0 = lo & 0x3FFu;
+    uint y0 = (lo >> 10) & 0x3FFu;
+    uint v0 = (lo >> 20) & 0x3FFu;
+    uint y1 = ((lo >> 30) | (hi << 2)) & 0x3FFu;
+
+    // Wave-swap and pack two Y values into one uint32 write
+    uint y0_ws = wave_swap(y0);
+    uint y1_ws = wave_swap(y1);
+    y_output.data[pair_idx] = y0_ws | (y1_ws << 16);
+
+    // UV plane: 2x2 chroma subsampling — only even rows
+    if ((row & 1u) == 0u && row + 1u < params.height) {
+        // Read pair from row below
+        uint next_pair = pair_idx + params.pairs_per_row;
+        uint next_byte = next_pair * 5u;
+        uint nw_idx = next_byte >> 2;
+        uint nshift = (next_byte & 3u) << 3;
+
+        uint nw0 = input_buffer.data[nw_idx];
+        uint nw1 = input_buffer.data[nw_idx + 1];
+
+        uint nlo;
+        if (nshift == 0u) {
+            nlo = nw0;
+        } else {
+            uint nw2 = input_buffer.data[nw_idx + 2];
+            nlo = (nw0 >> nshift) | (nw1 << (32u - nshift));
+        }
+
+        uint u1 = nlo & 0x3FFu;
+        uint v1 = (nlo >> 20) & 0x3FFu;
+
         // Average with rounding
-        uint u_avg = (u0 + u1 + 1) >> 1;
-        uint v_avg = (v0 + v1 + 1) >> 1;
-        
-        // Convert to Wave521 format: byte-swap the raw 10-bit values
-        uint16_t u_p010 = wave_swap(u_avg);
-        uint16_t v_p010 = wave_swap(v_avg);
-        
-        // Write UV plane (interleaved U,V)
-        uint uv_row = row / 2;
-        uint uv_idx = (uv_row * (params.width / 2) + col) * 2;
-        uv_output.data[uv_idx + 0] = u_p010;
-        uv_output.data[uv_idx + 1] = v_p010;
+        uint u_avg = (u0 + u1 + 1u) >> 1;
+        uint v_avg = (v0 + v1 + 1u) >> 1;
+
+        // Wave-swap and pack U,V into one uint32 write
+        uint u_ws = wave_swap(u_avg);
+        uint v_ws = wave_swap(v_avg);
+
+        uint uv_row = row >> 1;
+        uint uv_idx = uv_row * params.pairs_per_row + col;
+        uv_output.data[uv_idx] = u_ws | (v_ws << 16);
     }
 }
