@@ -33,8 +33,10 @@
 #include <gst/video/video.h>
 #include <gst/allocators/gstdmabuf.h>
 #include <linux/dma-heap.h>
+#include <linux/dma-buf.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -44,6 +46,7 @@
 
 #include "gstamlionallocator.h"
 #include "yuv422_converter_gpu_gles.h"
+#include "yuv422_converter_vulkan.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_amlvenc_debug);
 #define GST_CAT_DEFAULT gst_amlvenc_debug
@@ -109,6 +112,7 @@ gst_amlvenc_add_v_chroma_format (GstAmlVEnc *encoder, GstStructure * s)
 #define PROP_GOP_PATTERN_DEFAULT 0
 #define PROP_RC_MODE_DEFAULT 0
 #define PROP_LOSSLESS_ENABLE_DEFAULT FALSE
+#define PROP_V10CONV_BACKEND_DEFAULT 0  /* 0=vulkan, 1=gles */
 
 #define DRMBP_EXTRA_BUF_SIZE_FOR_DISPLAY 1
 #define DRMBP_LIMIT_MAX_BUFSIZE_TO_BUFSIZE 1
@@ -158,6 +162,15 @@ gst_amlvenc_clear_v10conv_buffers (GstAmlVEnc * encoder)
   if (encoder->v10conv.output_uv.memory) {
     gst_memory_unref (encoder->v10conv.output_uv.memory);
     encoder->v10conv.output_uv.memory = NULL;
+  }
+  /* Close dup'd fds we own */
+  if (encoder->v10conv.output_y.fd_dup >= 0) {
+    close (encoder->v10conv.output_y.fd_dup);
+    encoder->v10conv.output_y.fd_dup = -1;
+  }
+  if (encoder->v10conv.output_uv.fd_dup >= 0) {
+    close (encoder->v10conv.output_uv.fd_dup);
+    encoder->v10conv.output_uv.fd_dup = -1;
   }
   encoder->v10conv.output_y.fd = -1;
   encoder->v10conv.output_uv.fd = -1;
@@ -224,7 +237,8 @@ enum
   PROP_GOP_PATTERN,
   PROP_RC_MODE,
   PROP_LOSSLESS_ENABLE,
-  PROD_ENABLE_DMALLOCATOR
+  PROD_ENABLE_DMALLOCATOR,
+  PROP_V10CONV_BACKEND
 };
 
 struct aml_roi_location {
@@ -594,6 +608,11 @@ gst_amlvenc_class_init (GstAmlVEncClass * klass)
           FALSE,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_V10CONV_BACKEND,
+      g_param_spec_int ("v10conv-backend", "v10conv-backend", "V10 conversion backend (0=vulkan, 1=gles)",
+          0, 1, PROP_V10CONV_BACKEND_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   gst_element_class_set_static_metadata (element_class,
     "Amlogic h264/h265 Multi-Encoder",
     "Codec/Encoder/Video",
@@ -635,6 +654,7 @@ gst_amlvenc_init (GstAmlVEnc * encoder)
   encoder->gop_pattern = PROP_GOP_PATTERN_DEFAULT;
   encoder->rc_mode = PROP_RC_MODE_DEFAULT;
   encoder->lossless_enable = PROP_LOSSLESS_ENABLE_DEFAULT;
+  encoder->v10conv_backend = PROP_V10CONV_BACKEND_DEFAULT;
 
   list_init(&encoder->roi.param_info);
   encoder->roi.srcid = 0;
@@ -675,6 +695,8 @@ gst_amlvenc_start (GstVideoEncoder * encoder)
   venc->v10conv.output_uv.memory = NULL;
   venc->v10conv.output_y.fd = -1;
   venc->v10conv.output_uv.fd = -1;
+  venc->v10conv.output_y.fd_dup = -1;
+  venc->v10conv.output_uv.fd_dup = -1;
   /* make sure that we have enough time for first DTS,
      this is probably overkill for most streams */
   gst_video_encoder_set_min_pts (encoder, GST_MSECOND * 30);
@@ -1402,13 +1424,87 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
         GST_ERROR_OBJECT (encoder, "failed to prepare internal v10 conversion buffers");
         return GST_FLOW_ERROR;
       }
-      if (yuv422_gpu_gles_convert_p010_dmabuf (in_fd,
-              encoder->v10conv.output_y.fd,
-              info->width, info->height) != 0) {
-        GST_ERROR_OBJECT (encoder, "internal v10 conversion failed (%s)",
-            yuv422_gpu_gles_last_error ());
+      /* Dup output fd so we own it independently of GstMemory lifecycle.
+       * This prevents "Bad file descriptor" when buffer pool reclaims GstMemory.
+       */
+      if (encoder->v10conv.output_y.fd_dup >= 0) {
+        close(encoder->v10conv.output_y.fd_dup);
+      }
+      encoder->v10conv.output_y.fd_dup = dup(encoder->v10conv.output_y.fd);
+      if (encoder->v10conv.output_y.fd_dup < 0) {
+        GST_ERROR_OBJECT(encoder, "failed to dup output fd: %s", strerror(errno));
         return GST_FLOW_ERROR;
       }
+      GST_WARNING_OBJECT(encoder, "dup'd output fd: original=%d dup=%d",
+          encoder->v10conv.output_y.fd, encoder->v10conv.output_y.fd_dup);
+      
+      /* Use selected backend: 0=vulkan (default), 1=gles */
+      gint64 t_conv_start = g_get_monotonic_time();
+      int conv_result = -1;
+      
+      if (encoder->v10conv_backend == 0) {
+        /* Vulkan backend (default) */
+        static gboolean vulkan_initialized = FALSE;
+        if (!vulkan_initialized) {
+          if (yuv422_vulkan_init(info->width, info->height) == 0) {
+            vulkan_initialized = TRUE;
+            GST_WARNING_OBJECT(encoder, "Vulkan converter initialized successfully");
+          } else {
+            GST_ERROR_OBJECT(encoder, "Vulkan init failed (%s)",
+                yuv422_vulkan_last_error());
+            close(encoder->v10conv.output_y.fd_dup);
+            encoder->v10conv.output_y.fd_dup = -1;
+            return GST_FLOW_ERROR;
+          }
+        }
+        
+        /* Validate fd before Vulkan conversion */
+        struct stat st;
+        if (fstat(encoder->v10conv.output_y.fd_dup, &st) < 0) {
+          GST_ERROR_OBJECT(encoder, "fd_dup %d invalid before Vulkan: %s",
+              encoder->v10conv.output_y.fd_dup, strerror(errno));
+          close(encoder->v10conv.output_y.fd_dup);
+          encoder->v10conv.output_y.fd_dup = -1;
+          return GST_FLOW_ERROR;
+        }
+        GST_WARNING_OBJECT(encoder, "fd_dup %d valid before Vulkan", encoder->v10conv.output_y.fd_dup);
+        
+        /* Use dup'd fd - Vulkan will dup it again internally */
+        conv_result = yuv422_vulkan_convert_dmabuf(in_fd,
+            encoder->v10conv.output_y.fd_dup, info->width, info->height);
+        if (conv_result != 0) {
+          GST_ERROR_OBJECT(encoder, "Vulkan conversion failed (%s)",
+              yuv422_vulkan_last_error());
+          return GST_FLOW_ERROR;
+        }
+        
+        /* Validate fd after Vulkan conversion */
+        if (fstat(encoder->v10conv.output_y.fd_dup, &st) < 0) {
+          GST_ERROR_OBJECT(encoder, "fd_dup %d invalid AFTER Vulkan: %s",
+              encoder->v10conv.output_y.fd_dup, strerror(errno));
+        } else {
+          GST_WARNING_OBJECT(encoder, "fd_dup %d still valid after Vulkan (size=%ld)", 
+              encoder->v10conv.output_y.fd_dup, (long)st.st_size);
+        }
+        GST_WARNING_OBJECT(encoder, "Vulkan conversion succeeded");
+      } else {
+        /* GLES backend - also use dup'd fd */
+        if (yuv422_gpu_gles_convert_p010_dmabuf (in_fd,
+                encoder->v10conv.output_y.fd_dup,
+                info->width, info->height) != 0) {
+          GST_ERROR_OBJECT (encoder, "GLES conversion failed (%s)",
+              yuv422_gpu_gles_last_error ());
+          close(encoder->v10conv.output_y.fd_dup);
+          encoder->v10conv.output_y.fd_dup = -1;
+          return GST_FLOW_ERROR;
+        }
+        GST_WARNING_OBJECT(encoder, "GLES conversion succeeded");
+      }
+      
+      gint64 conv_us = g_get_monotonic_time() - t_conv_start;
+      GST_WARNING_OBJECT(encoder, "[ENC-PROF] %s conversion time: %" G_GINT64_FORMAT " us (%.2f ms)",
+          encoder->v10conv_backend == 0 ? "Vulkan" : "GLES",
+          conv_us, conv_us / 1000.0);
 
       /* GPU shader outputs Wave521 MSB format directly - no CPU repack needed */
 
@@ -1421,6 +1517,14 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
       {
         static gboolean logged_p010_stats = FALSE;
         if (!logged_p010_stats) {
+          /* Sync dmabuf for CPU read — invalidate cache to see GPU writes */
+          struct dma_buf_sync sync_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+          struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+          int sync_fd = gst_dmabuf_memory_get_fd(encoder->v10conv.output_y.memory);
+          if (sync_fd >= 0) {
+            ioctl(sync_fd, DMA_BUF_IOCTL_SYNC, &sync_start);
+          }
+
           GstMapInfo p010_map;
           if (gst_memory_map (encoder->v10conv.output_y.memory, &p010_map, GST_MAP_READ)) {
             guint y_samples = MIN ((guint)(info->width * info->height), 4096u);
@@ -1449,9 +1553,16 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
             gst_memory_unmap (encoder->v10conv.output_y.memory, &p010_map);
             logged_p010_stats = TRUE;
           }
+
+          if (sync_fd >= 0) {
+            ioctl(sync_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+          }
         }
       }
 
+      /* Use ORIGINAL fd for encoder - Vulkan owns the dup'd fd and will close it.
+       * The original fd remains valid as long as GstMemory is alive.
+       */
       encoder->fd[0] = encoder->v10conv.output_y.fd;
       encoder->fd[1] = -1;
       ui1_plane_num = 1;
@@ -1580,6 +1691,18 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
       vl_multi_encoder_encode(encoder->codec.handle, frame_type,
                               encoder->codec.buf, &inbuf_info, &retbuf_info);
 
+  /* Release Vulkan output resources after encoder is done with them */
+  if (encoder->v10conv.enabled && encoder->v10conv_backend == 0) {
+    yuv422_vulkan_release_output();
+  }
+  
+  /* Close dup'd output fd after encoding completes */
+  if (encoder->v10conv.enabled && encoder->v10conv.output_y.fd_dup >= 0) {
+    GST_WARNING_OBJECT(encoder, "closing dup'd output fd: %d", encoder->v10conv.output_y.fd_dup);
+    close(encoder->v10conv.output_y.fd_dup);
+    encoder->v10conv.output_y.fd_dup = -1;
+  }
+
   if (!meta.is_valid) {
     if (frame) {
       GST_ELEMENT_ERROR (encoder, STREAM, ENCODE, ("Encode v frame failed."),
@@ -1707,6 +1830,9 @@ gst_amlvenc_get_property (GObject * object, guint prop_id,
     case PROP_LOSSLESS_ENABLE:
       g_value_set_boolean (value, encoder->lossless_enable);
       break;
+    case PROP_V10CONV_BACKEND:
+      g_value_set_int (value, encoder->v10conv_backend);
+      break;
     case PROD_ENABLE_DMALLOCATOR:
       g_value_set_boolean (value, encoder->b_enable_dmallocator);
       break;
@@ -1799,6 +1925,11 @@ gst_amlvenc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_LOSSLESS_ENABLE:
       encoder->lossless_enable = g_value_get_boolean (value);
+      break;
+    case PROP_V10CONV_BACKEND:
+      encoder->v10conv_backend = g_value_get_int (value);
+      GST_WARNING_OBJECT (encoder, "v10conv-backend set to %d (0=vulkan, 1=gles)",
+          encoder->v10conv_backend);
       break;
     case PROD_ENABLE_DMALLOCATOR: {
       gboolean enabled = g_value_get_boolean (value);

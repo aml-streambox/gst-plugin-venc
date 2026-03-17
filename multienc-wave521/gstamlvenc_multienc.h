@@ -69,6 +69,7 @@ struct _GstAmlVEnc
     struct {
       GstMemory *memory;
       gint fd;
+      gint fd_dup;  /* dup'd fd we own, valid during encoding */
     } output_y, output_uv;
   } v10conv;
 
@@ -90,6 +91,9 @@ struct _GstAmlVEnc
   gint gop_pattern;
   gint rc_mode;
   gboolean lossless_enable;
+  
+  /* v10 conversion backend: 0=vulkan (default), 1=gles */
+  gint v10conv_backend;
 
   struct roi_info {
     guint srcid;
