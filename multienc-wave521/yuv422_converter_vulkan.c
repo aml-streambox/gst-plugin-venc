@@ -2,10 +2,10 @@
  * Vulkan-based Zero-Copy YUV422 to P010 Converter
  * 
  * Optimized for Mali-G52 (Bifrost) on Amlogic T7/T7C:
- * - Cached dmabuf imports (no per-frame alloc/free)
+ * - Cached dmabuf imports (both input and output — no per-frame alloc/free)
+ * - DMA_BUF_IOCTL_SYNC on input to invalidate GPU cache for fresh frame data
  * - uint32 reads + packed uint32 writes in shader
  * - 2D dispatch eliminates integer divides
- * - Minimal per-frame overhead (~100us host-side)
  */
 
 #define _GNU_SOURCE
@@ -21,6 +21,8 @@
 #include <time.h>
 #include <errno.h>
 #include <stdbool.h>
+#include <linux/dma-buf.h>
+#include <sys/ioctl.h>
 
 #include "yuv422_converter_vulkan.h"
 
@@ -101,7 +103,7 @@ typedef struct {
     /* Cached output dmabuf import (same fd every frame) */
     DmabufCacheEntry cached_output;
     
-    /* Cached input dmabuf imports (fd-keyed pool) */
+    /* Cached input dmabuf imports (fd-keyed pool with DMA_BUF_SYNC) */
     DmabufCacheEntry input_cache[DMABUF_CACHE_SIZE];
     int input_cache_count;
     
@@ -292,7 +294,9 @@ static int input_cache_get(int fd, VkDeviceSize size) {
     ctx.input_cache[slot].valid = 1;
     ctx.input_cache[slot].last_used = ctx.frame_count;
     
+#if VULKAN_DEBUG
     fprintf(stderr, "[VULKAN] Input cache MISS fd=%d slot=%d (total cached=%d)\n", fd, slot, ctx.input_cache_count);
+#endif
     
     return slot;
 }
@@ -330,7 +334,9 @@ static int output_cache_get(int fd, VkDeviceSize size) {
     ctx.cached_output.size = size;
     ctx.cached_output.valid = 1;
     
+#if VULKAN_DEBUG
     fprintf(stderr, "[VULKAN] Output cache MISS fd=%d (imported)\n", fd);
+#endif
     return 0;
 }
 
@@ -652,17 +658,28 @@ int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t
             width, height, (unsigned long)ctx.frame_count);
 #endif
     
-    /* === Cached dmabuf imports === */
+    /* === Cached dmabuf imports + DMA-buf sync === */
     
-    /* Input: look up or import */
+    /* Input: cached import with DMA_BUF_IOCTL_SYNC to invalidate GPU cache.
+     * v4l2src reuses a ring of ~6 dmabuf fds — the same fd carries different
+     * frame content each time. The Vulkan buffer/memory import is cached (same
+     * physical pages), but we must tell the kernel to invalidate caches so the
+     * GPU sees the capture device's latest writes.
+     */
     int in_idx = input_cache_get(in_fd, input_size);
     if (in_idx < 0) {
         return -1;
     }
     ctx.active_input_idx = in_idx;
+    
+    /* DMA_BUF_SYNC_START(READ) — invalidate CPU/GPU caches for this dmabuf
+     * so the compute shader reads the capture device's latest frame data */
+    struct dma_buf_sync sync_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start);
+    
     VkBuffer in_buffer = ctx.input_cache[in_idx].buffer;
     
-    /* Output: look up or import (same fd every frame) */
+    /* Output: look up or import (same fd every frame — safe to cache) */
     if (output_cache_get(out_fd, output_size) != 0) {
         return -1;
     }
@@ -760,6 +777,12 @@ int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t
     
     /* Wait for GPU */
     result = vkWaitForFences(ctx.device, 1, &ctx.fences[0], VK_TRUE, 5000000000ULL);
+    
+    /* DMA_BUF_SYNC_END(READ) — release our read access to the input dmabuf
+     * so the capture device can write new frame data to it */
+    struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+    
     if (result != VK_SUCCESS) {
         snprintf(ctx.last_error, sizeof(ctx.last_error), "vkWaitForFences failed: %d (frame %lu)", result, (unsigned long)ctx.frame_count);
         fprintf(stderr, "[VULKAN-ERR] %s\n", ctx.last_error);
@@ -770,7 +793,9 @@ int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t
     
     ctx.frame_count++;
     double elapsed = now_ms() - t_start;
-    fprintf(stderr, "[VULKAN-PROF] Convert frame %lu: %.3f ms (CACHED)\n", (unsigned long)(ctx.frame_count - 1), elapsed);
+#if VULKAN_DEBUG
+    fprintf(stderr, "[VULKAN-PROF] Convert frame %lu: %.3f ms (CACHED+SYNC)\n", (unsigned long)(ctx.frame_count - 1), elapsed);
+#endif
     
     return 0;
 }
