@@ -146,10 +146,20 @@ static const char *shader_y =
   "  uint y2_0=((w2>>26u)|(w3<<6u))&0x3FFu; uint y2_1=(w3>>14u)&0x3FFu;\n"
   "  uint y3_0=(w4>>2u)&0x3FFu; uint y3_1=(w4>>22u)&0x3FFu;\n"
   "  uint p = r * PAIRS_PER_ROW + tile_x*32u + lane*4u;\n"
-  "  out_y[p+0u]=(y0_0<<6u)|((y0_1<<6u)<<16u);\n"
-  "  out_y[p+1u]=(y1_0<<6u)|((y1_1<<6u)<<16u);\n"
-  "  out_y[p+2u]=(y2_0<<6u)|((y2_1<<6u)<<16u);\n"
-  "  out_y[p+3u]=(y3_0<<6u)|((y3_1<<6u)<<16u);\n"
+  // Direct Wave521 format: byte-swap the 10-bit value
+  // out = ((val & 0xFF) << 8) | ((val >> 8) & 0x3)
+  "  uint y0_0_wave = ((y0_0 & 0xFFu) << 8) | ((y0_0 >> 8) & 0x3u);\n"
+  "  uint y0_1_wave = ((y0_1 & 0xFFu) << 8) | ((y0_1 >> 8) & 0x3u);\n"
+  "  uint y1_0_wave = ((y1_0 & 0xFFu) << 8) | ((y1_0 >> 8) & 0x3u);\n"
+  "  uint y1_1_wave = ((y1_1 & 0xFFu) << 8) | ((y1_1 >> 8) & 0x3u);\n"
+  "  uint y2_0_wave = ((y2_0 & 0xFFu) << 8) | ((y2_0 >> 8) & 0x3u);\n"
+  "  uint y2_1_wave = ((y2_1 & 0xFFu) << 8) | ((y2_1 >> 8) & 0x3u);\n"
+  "  uint y3_0_wave = ((y3_0 & 0xFFu) << 8) | ((y3_0 >> 8) & 0x3u);\n"
+  "  uint y3_1_wave = ((y3_1 & 0xFFu) << 8) | ((y3_1 >> 8) & 0x3u);\n"
+  "  out_y[p+0u]=y0_0_wave|(y0_1_wave<<16u);\n"
+  "  out_y[p+1u]=y1_0_wave|(y1_1_wave<<16u);\n"
+  "  out_y[p+2u]=y2_0_wave|(y2_1_wave<<16u);\n"
+  "  out_y[p+3u]=y3_0_wave|(y3_1_wave<<16u);\n"
   "}\n";
 
 static const char *shader_uv =
@@ -192,10 +202,23 @@ static const char *shader_uv =
   "  uint u2b=(bw2>>16u)&0x3FFu, v2b=(bw3>>4u)&0x3FFu;\n"
   "  uint u3b=((bw3>>24u)|(bw4<<8u))&0x3FFu, v3b=(bw4>>12u)&0x3FFu;\n"
   "  uint p = ur * PAIRS_PER_ROW + tile_x*32u + lane*4u;\n"
-  "  out_uv[p+0u]=(((u0t+u0b+1u)>>1u)<<6u)|(((((v0t+v0b+1u)>>1u)<<6u))<<16u);\n"
-  "  out_uv[p+1u]=(((u1t+u1b+1u)>>1u)<<6u)|(((((v1t+v1b+1u)>>1u)<<6u))<<16u);\n"
-  "  out_uv[p+2u]=(((u2t+u2b+1u)>>1u)<<6u)|(((((v2t+v2b+1u)>>1u)<<6u))<<16u);\n"
-  "  out_uv[p+3u]=(((u3t+u3b+1u)>>1u)<<6u)|(((((v3t+v3b+1u)>>1u)<<6u))<<16u);\n"
+  // UV averaging and Wave521 byte-swap
+  "  uint u0=((u0t+u0b+1u)>>1u), v0=((v0t+v0b+1u)>>1u);\n"
+  "  uint u1=((u1t+u1b+1u)>>1u), v1=((v1t+v1b+1u)>>1u);\n"
+  "  uint u2=((u2t+u2b+1u)>>1u), v2=((v2t+v2b+1u)>>1u);\n"
+  "  uint u3=((u3t+u3b+1u)>>1u), v3=((v3t+v3b+1u)>>1u);\n"
+  "  uint u0_wave = ((u0 & 0xFFu) << 8) | ((u0 >> 8) & 0x3u);\n"
+  "  uint v0_wave = ((v0 & 0xFFu) << 8) | ((v0 >> 8) & 0x3u);\n"
+  "  uint u1_wave = ((u1 & 0xFFu) << 8) | ((u1 >> 8) & 0x3u);\n"
+  "  uint v1_wave = ((v1 & 0xFFu) << 8) | ((v1 >> 8) & 0x3u);\n"
+  "  uint u2_wave = ((u2 & 0xFFu) << 8) | ((u2 >> 8) & 0x3u);\n"
+  "  uint v2_wave = ((v2 & 0xFFu) << 8) | ((v2 >> 8) & 0x3u);\n"
+  "  uint u3_wave = ((u3 & 0xFFu) << 8) | ((u3 >> 8) & 0x3u);\n"
+  "  uint v3_wave = ((v3 & 0xFFu) << 8) | ((v3 >> 8) & 0x3u);\n"
+  "  out_uv[p+0u]=u0_wave|(v0_wave<<16u);\n"
+  "  out_uv[p+1u]=u1_wave|(v1_wave<<16u);\n"
+  "  out_uv[p+2u]=u2_wave|(v2_wave<<16u);\n"
+  "  out_uv[p+3u]=u3_wave|(v3_wave<<16u);\n"
   "}\n";
 
 static const char *shader_pack =

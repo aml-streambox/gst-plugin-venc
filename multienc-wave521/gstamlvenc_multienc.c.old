@@ -31,19 +31,12 @@
 #include <gst/video/gstvideopool.h>
 #include <gst/video/gstvideosink.h>
 #include <gst/video/video.h>
-#include <gst/allocators/gstdmabuf.h>
-#include <linux/dma-heap.h>
-#include <sys/ioctl.h>
-#include <sys/mman.h>
-#include <fcntl.h>
-#include <unistd.h>
 #include <string.h>
 
 #include "gstamlvenc_multienc.h"
 #include "imgproc.h"
 
 #include "gstamlionallocator.h"
-#include "yuv422_converter_gpu_gles.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_amlvenc_debug);
 #define GST_CAT_DEFAULT gst_amlvenc_debug
@@ -69,10 +62,6 @@ gst_amlvenc_add_v_chroma_format (GstAmlVEnc *encoder, GstStructure * s)
   g_value_set_string (&fmt, "RGB");
   gst_value_list_append_value (&fmts, &fmt);
   g_value_set_string (&fmt, "BGR");
-  gst_value_list_append_value (&fmts, &fmt);
-  g_value_set_string (&fmt, "P010_10LE");
-  gst_value_list_append_value (&fmts, &fmt);
-  g_value_set_string (&fmt, "ENCODED");
   gst_value_list_append_value (&fmts, &fmt);
 
   if (gst_value_list_get_size (&fmts) != 0) {
@@ -104,105 +93,8 @@ gst_amlvenc_add_v_chroma_format (GstAmlVEnc *encoder, GstStructure * s)
 #define PROP_ROI_X_DEFAULT 0.00
 #define PROP_ROI_Y_DEFAULT 0.00
 #define PROP_ROI_QUALITY_DEFAULT 51
-
-#define PROP_INTERNAL_BIT_DEPTH_DEFAULT 8
-#define PROP_GOP_PATTERN_DEFAULT 0
-#define PROP_RC_MODE_DEFAULT 0
-#define PROP_LOSSLESS_ENABLE_DEFAULT FALSE
-
 #define DRMBP_EXTRA_BUF_SIZE_FOR_DISPLAY 1
 #define DRMBP_LIMIT_MAX_BUFSIZE_TO_BUFSIZE 1
-
-static int
-gst_amlvenc_alloc_dma_heap_fd (gsize size)
-{
-  const char *heaps[] = {
-    "/dev/dma_heap/heap-codecmm",
-    "/dev/dma_heap/heap-cached-codecmm",
-    "/dev/dma_heap/heap-gfx",
-    "/dev/dma_heap/system-uncached",
-    "/dev/dma_heap/system",
-    NULL
-  };
-  int i;
-
-  for (i = 0; heaps[i] != NULL; i++) {
-    int heapfd = open (heaps[i], O_RDWR | O_CLOEXEC);
-    struct dma_heap_allocation_data alloc_data;
-
-    if (heapfd < 0)
-      continue;
-
-    memset (&alloc_data, 0, sizeof (alloc_data));
-    alloc_data.len = size;
-    alloc_data.fd_flags = O_RDWR | O_CLOEXEC;
-
-    if (ioctl (heapfd, DMA_HEAP_IOCTL_ALLOC, &alloc_data) == 0) {
-      close (heapfd);
-      return alloc_data.fd;
-    }
-
-    close (heapfd);
-  }
-
-  return -1;
-}
-
-static void
-gst_amlvenc_clear_v10conv_buffers (GstAmlVEnc * encoder)
-{
-  if (encoder->v10conv.output_y.memory) {
-    gst_memory_unref (encoder->v10conv.output_y.memory);
-    encoder->v10conv.output_y.memory = NULL;
-  }
-  if (encoder->v10conv.output_uv.memory) {
-    gst_memory_unref (encoder->v10conv.output_uv.memory);
-    encoder->v10conv.output_uv.memory = NULL;
-  }
-  encoder->v10conv.output_y.fd = -1;
-  encoder->v10conv.output_uv.fd = -1;
-}
-
-static gboolean
-gst_amlvenc_prepare_v10conv_buffers (GstAmlVEnc * encoder, const GstVideoInfo * info)
-{
-  gsize out_size = info->width * info->height * 3;
-  int out_fd = -1;
-
-  if (encoder->v10conv.output_y.memory)
-    return TRUE;
-
-  if (!encoder->v10conv.allocator)
-    encoder->v10conv.allocator = gst_dmabuf_allocator_new ();
-
-  if (!encoder->v10conv.allocator)
-    return FALSE;
-
-  out_fd = gst_amlvenc_alloc_dma_heap_fd (out_size);
-  if (out_fd < 0)
-    goto fail;
-
-  /*
-   * Use a single contiguous P010 buffer (Y then UV) for Wave521 input.
-   * Some firmware paths interpret IMG_FMT_P010 as one-plane contiguous memory.
-   */
-  encoder->v10conv.output_y.memory =
-      gst_dmabuf_allocator_alloc (encoder->v10conv.allocator,
-      out_fd, out_size);
-  if (!encoder->v10conv.output_y.memory)
-    goto fail;
-
-  encoder->v10conv.output_y.fd =
-      gst_dmabuf_memory_get_fd (encoder->v10conv.output_y.memory);
-  encoder->v10conv.output_uv.fd = -1;
-  return TRUE;
-
-fail:
-  if (out_fd >= 0 && !encoder->v10conv.output_y.memory)
-    close (out_fd);
-  gst_amlvenc_clear_v10conv_buffers (encoder);
-  return FALSE;
-}
 
 enum
 {
@@ -220,10 +112,6 @@ enum
   PROP_ROI_X,
   PROP_ROI_Y,
   PROP_ROI_QUALITY,
-  PROP_INTERNAL_BIT_DEPTH,
-  PROP_GOP_PATTERN,
-  PROP_RC_MODE,
-  PROP_LOSSLESS_ENABLE,
   PROD_ENABLE_DMALLOCATOR
 };
 
@@ -263,10 +151,6 @@ static void gst_amlvenc_finalize (GObject * object);
 static gboolean gst_amlvenc_start (GstVideoEncoder * encoder);
 static gboolean gst_amlvenc_stop (GstVideoEncoder * encoder);
 static gboolean gst_amlvenc_flush (GstVideoEncoder * encoder);
-static int gst_amlvenc_alloc_dma_heap_fd (gsize size);
-static gboolean gst_amlvenc_prepare_v10conv_buffers (GstAmlVEnc * encoder,
-    const GstVideoInfo * info);
-static void gst_amlvenc_clear_v10conv_buffers (GstAmlVEnc * encoder);
 
 static gboolean gst_amlvenc_init_encoder (GstAmlVEnc * encoder);
 static gboolean gst_amlvenc_set_roi(GstAmlVEnc * encoder);
@@ -312,9 +196,6 @@ img_format_convert (GstVideoFormat vfmt) {
   case GST_VIDEO_FORMAT_BGR:
     // use ge2d for internal conversation
     fmt = IMG_FMT_NV12;
-    break;
-  case GST_VIDEO_FORMAT_P010_10LE:
-    fmt = IMG_FMT_P010;
     break;
   default:
     fmt = IMG_FMT_NONE;
@@ -569,26 +450,6 @@ gst_amlvenc_class_init (GstAmlVEncClass * klass)
           0, 51, PROP_ROI_QUALITY_DEFAULT,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
-  g_object_class_install_property (gobject_class, PROP_INTERNAL_BIT_DEPTH,
-      g_param_spec_int("internal-bit-depth", "internal-bit-depth", "Encoder internal bit depth (8 or 10)",
-          8, 10, PROP_INTERNAL_BIT_DEPTH_DEFAULT,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-  g_object_class_install_property (gobject_class, PROP_GOP_PATTERN,
-      g_param_spec_int("gop-pattern", "gop-pattern", "GOP structure pattern (0=IP, 1=IBBBP, 2=IBPBP, 3=ALL_I)",
-          0, 4, PROP_GOP_PATTERN_DEFAULT,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-  g_object_class_install_property (gobject_class, PROP_RC_MODE,
-      g_param_spec_int("rc-mode", "rc-mode", "Rate control mode (0=VBR, 1=CBR, 2=CQP)",
-          0, 2, PROP_RC_MODE_DEFAULT,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
-  g_object_class_install_property (gobject_class, PROP_LOSSLESS_ENABLE,
-      g_param_spec_boolean("lossless-enable", "lossless-enable", "Enable lossless encoding (HEVC only - disables rate control, NR, ROI)",
-          PROP_LOSSLESS_ENABLE_DEFAULT,
-          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
-
   g_object_class_install_property (gobject_class, PROD_ENABLE_DMALLOCATOR,
       g_param_spec_boolean ("enable-dmallocator", "enable-dmallocator", "Enable/Disable dmallocator",
           FALSE,
@@ -631,10 +492,6 @@ gst_amlvenc_init (GstAmlVEnc * encoder)
   encoder->min_buffers = PROP_MIN_BUFFERS_DEFAULT;
   encoder->encoder_bufsize = PROP_ENCODER_BUFFER_SIZE_DEFAULT * 1024;
   encoder->codec.id = CODEC_ID_NONE;
-  encoder->internal_bit_depth = PROP_INTERNAL_BIT_DEPTH_DEFAULT;
-  encoder->gop_pattern = PROP_GOP_PATTERN_DEFAULT;
-  encoder->rc_mode = PROP_RC_MODE_DEFAULT;
-  encoder->lossless_enable = PROP_LOSSLESS_ENABLE_DEFAULT;
 
   list_init(&encoder->roi.param_info);
   encoder->roi.srcid = 0;
@@ -669,12 +526,6 @@ gst_amlvenc_start (GstVideoEncoder * encoder)
   }
   venc->imgproc.input.memory = NULL;
   venc->imgproc.output.memory = NULL;
-  venc->v10conv.enabled = FALSE;
-  venc->v10conv.allocator = NULL;
-  venc->v10conv.output_y.memory = NULL;
-  venc->v10conv.output_uv.memory = NULL;
-  venc->v10conv.output_y.fd = -1;
-  venc->v10conv.output_uv.fd = -1;
   /* make sure that we have enough time for first DTS,
      this is probably overkill for most streams */
   gst_video_encoder_set_min_pts (encoder, GST_MSECOND * 30);
@@ -687,6 +538,11 @@ gst_amlvenc_stop (GstVideoEncoder * encoder)
 {
   GstAmlVEnc *venc = GST_AMLVENC (encoder);
 
+  GST_INFO_OBJECT (venc, "Stopping encoder, cleaning up resources");
+
+  /* Set encoder to NULL state first to unblock any waiting operations.
+   * This handles the case where GStreamer exits while in PAUSE state
+   * and the encoder is waiting for frames. */
   gst_amlvenc_close_encoder (venc);
 
   if (venc->roi.srcid)
@@ -715,12 +571,6 @@ gst_amlvenc_stop (GstVideoEncoder * encoder)
   if (venc->imgproc.output.memory) {
     gst_memory_unref(venc->imgproc.output.memory);
     venc->imgproc.output.memory = NULL;
-  }
-
-  gst_amlvenc_clear_v10conv_buffers (venc);
-  if (venc->v10conv.allocator) {
-    gst_object_unref (venc->v10conv.allocator);
-    venc->v10conv.allocator = NULL;
   }
 
   if (venc->roi.buffer_info.data) {
@@ -755,7 +605,6 @@ static gboolean
 gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
 {
   GstVideoInfo *info;
-  GstVideoInfo p010_info;
 
   if (!encoder->input_state) {
     GST_DEBUG_OBJECT (encoder, "Have no input state yet");
@@ -783,64 +632,6 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encode_info.img_format = img_format_convert(GST_VIDEO_INFO_FORMAT(info));
   encode_info.prepend_spspps_to_idr_frames = TRUE;
   encode_info.enc_feature_opts |= 0x1;  // enable roi function
-  encode_info.internal_bit_depth = encoder->internal_bit_depth;
-  encode_info.gop_pattern = encoder->gop_pattern;
-  encode_info.rc_mode = encoder->rc_mode;
-  encode_info.lossless_enable = encoder->lossless_enable;
-  encoder->v10conv.enabled = (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_ENCODED);
-
-  if (encoder->v10conv.enabled) {
-      /*
-       * Build a virtual P010_10LE video info for proper encoder initialization.
-       * The source may have ENCODED format with different semantics, but after
-       * internal GPU conversion we produce standard P010_10LE.
-       * Use source dimensions and framerate for the virtual info.
-       */
-      gst_video_info_init (&p010_info);
-      gst_video_info_set_format (&p010_info, GST_VIDEO_FORMAT_P010_10LE, info->width, info->height);
-      /* Preserve source framerate (e.g., 60fps), don't use encoder property default (30fps) */
-      p010_info.fps_n = info->fps_n;
-      p010_info.fps_d = info->fps_d;
-      /* Use virtual P010 info for encoder parameters */
-      info = &p010_info;
-      encode_info.img_format = IMG_FMT_P010;
-      /* Use source framerate for encoding, not the encoder property default */
-      if (info->fps_n > 0) {
-        encode_info.frame_rate = info->fps_n / info->fps_d;
-        /* Update encoder framerate property to match source for logging/consistency */
-        encoder->framerate = encode_info.frame_rate;
-      }
-      if (yuv422_gpu_gles_init () != 0) {
-        GST_ELEMENT_ERROR (encoder, STREAM, ENCODE,
-            ("Can not initialize internal v10 converter."), (NULL));
-        return FALSE;
-      }
-      if (!gst_amlvenc_prepare_v10conv_buffers (encoder, info)) {
-        GST_ELEMENT_ERROR (encoder, STREAM, ENCODE,
-            ("Can not allocate internal v10 conversion buffers."), (NULL));
-        return FALSE;
-      }
-  } else {
-      gst_amlvenc_clear_v10conv_buffers (encoder);
-  }
-
-  GST_WARNING_OBJECT (encoder,
-      "init encoder request: codec=%d format=%s %dx%d fps=%d bitrate=%d gop=%d depth=%d roi=%d min=%d max=%d dmalloc=%d gop_pattern=%d rc_mode=%d lossless=%d v10conv=%d",
-      encoder->codec.id,
-      gst_video_format_to_string (GST_VIDEO_INFO_FORMAT (info)),
-      info->width, info->height,
-      encoder->framerate,
-      encoder->bitrate * 1000,
-      encoder->gop,
-      encoder->internal_bit_depth,
-      encoder->roi.enabled ? 1 : 0,
-      encoder->min_buffers,
-      encoder->max_buffers,
-      encoder->b_enable_dmallocator ? 1 : 0,
-      encoder->gop_pattern,
-      encoder->rc_mode,
-      encoder->lossless_enable ? 1 : 0,
-      encoder->v10conv.enabled ? 1 : 0);
 
   qp_param_t qp_tbl;
   memset(&qp_tbl, 0, sizeof(qp_param_t));
@@ -857,15 +648,6 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encoder->codec.handle = vl_multi_encoder_init(encoder->codec.id, encode_info, &qp_tbl);
 
   if (encoder->codec.handle == 0) {
-    GST_WARNING_OBJECT (encoder,
-        "vl_multi_encoder_init failed: codec=%d format=%s %dx%d fps=%d bitrate=%d depth=%d roi=%d",
-        encoder->codec.id,
-        gst_video_format_to_string (GST_VIDEO_INFO_FORMAT (info)),
-        info->width, info->height,
-        encoder->framerate,
-        encoder->bitrate * 1000,
-        encoder->internal_bit_depth,
-        encoder->roi.enabled ? 1 : 0);
     GST_ELEMENT_ERROR (encoder, STREAM, ENCODE,
         ("Can not initialize v encoder."), (NULL));
     return FALSE;
@@ -999,14 +781,25 @@ idle_set_roi(GstAmlVEnc * self) {
  * @encoder:  Encoder which should close.
  *
  * Close v encoder.
+ * 
+ * Note: This function handles the case where GStreamer exits while in PAUSE
+ * state. The encoder driver has force_terminate support to prevent hanging
+ * when waiting for frames that will never arrive.
  */
 static void
 gst_amlvenc_close_encoder (GstAmlVEnc * encoder)
 {
-  if (encoder->codec.handle != 0) {
-    vl_multi_encoder_destroy(encoder->codec.handle);
-    encoder->codec.handle = 0;
+  vl_codec_handle_t handle_to_close = encoder->codec.handle;
+  
+  /* Clear handle first to prevent re-entrance issues */
+  encoder->codec.handle = 0;
+  
+  if (handle_to_close != 0) {
+    GST_INFO_OBJECT (encoder, "Destroying encoder handle %p", 
+        (void*)handle_to_close);
+    vl_multi_encoder_destroy(handle_to_close);
   }
+  
   if (encoder->imgproc.handle) {
     imgproc_deinit(encoder->imgproc.handle);
     encoder->imgproc.handle = NULL;
@@ -1200,11 +993,6 @@ gst_amlvenc_set_format (GstVideoEncoder * video_enc,
 
   gst_caps_unref (template_caps);
 
-  if (encoder->lossless_enable && encoder->codec.id == CODEC_ID_H264) {
-    GST_ERROR_OBJECT (encoder, "lossless-enable is HEVC-only feature, not supported for H.264");
-    return FALSE;
-  }
-
   // init roi buffer info
   if (encoder->codec.id == CODEC_ID_H265) {
     encoder->roi.block_size = 32;
@@ -1382,97 +1170,22 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
   vl_buffer_info_t retbuf_info;
 
   GstMemory *memory = gst_buffer_get_memory(frame->input_buffer, 0);
-  guint n_mem = gst_buffer_n_memory (frame->input_buffer);
   gboolean is_dmabuf = gst_is_dmabuf_memory(memory);
   GstMapInfo minfo;
-  GstVideoFormat submit_format = GST_VIDEO_INFO_FORMAT (info);
-  encoder->fd[0] = -1;
-  encoder->fd[1] = -1;
-  encoder->fd[2] = -1;
   GST_DEBUG_OBJECT(encoder, "is_dmabuf[%d] width[%d] height[%d]",is_dmabuf,info->width,info->height);
 
-  if (encoder->v10conv.enabled) {
-      int in_fd = gst_dmabuf_memory_get_fd (memory);
-      gst_memory_unref (memory);
-      if (!is_dmabuf || in_fd < 0 || n_mem >= 2) {
-        GST_ERROR_OBJECT (encoder, "internal v10 conversion requires single-plane dmabuf input");
-        return GST_FLOW_ERROR;
-      }
-      if (!gst_amlvenc_prepare_v10conv_buffers (encoder, info)) {
-        GST_ERROR_OBJECT (encoder, "failed to prepare internal v10 conversion buffers");
-        return GST_FLOW_ERROR;
-      }
-      if (yuv422_gpu_gles_convert_p010_dmabuf (in_fd,
-              encoder->v10conv.output_y.fd,
-              info->width, info->height) != 0) {
-        GST_ERROR_OBJECT (encoder, "internal v10 conversion failed (%s)",
-            yuv422_gpu_gles_last_error ());
-        return GST_FLOW_ERROR;
-      }
-
-      /* GPU shader outputs Wave521 MSB format directly - no CPU repack needed */
-
-      /* CRITICAL: Override submit format to P010_10LE since we just converted to it */
-      submit_format = GST_VIDEO_FORMAT_P010_10LE;
-      GST_WARNING_OBJECT (encoder,
-          "v10conv submit override: submit_format=%d (P010_10LE), width=%d, height=%d, stride=%d",
-          submit_format, info->width, info->height, info->width * 2);
-
-      {
-        static gboolean logged_p010_stats = FALSE;
-        if (!logged_p010_stats) {
-          GstMapInfo p010_map;
-          if (gst_memory_map (encoder->v10conv.output_y.memory, &p010_map, GST_MAP_READ)) {
-            guint y_samples = MIN ((guint)(info->width * info->height), 4096u);
-            guint uv_samples = MIN ((guint)(info->width * info->height / 2), 4096u);
-            guint y_min = 0xffff, y_max = 0;
-            guint uv_min = 0xffff, uv_max = 0;
-            guint i;
-            const guint16 *p = (const guint16 *) p010_map.data;
-            const guint16 *y = p;
-            const guint16 *uv = p + (info->width * info->height);
-
-            for (i = 0; i < y_samples; i++) {
-              guint v = y[i];
-              if (v < y_min) y_min = v;
-              if (v > y_max) y_max = v;
-            }
-            for (i = 0; i < uv_samples; i++) {
-              guint v = uv[i];
-              if (v < uv_min) uv_min = v;
-              if (v > uv_max) uv_max = v;
-            }
-
-            GST_WARNING_OBJECT (encoder,
-                "internal P010 sample stats: Y[min=%u max=%u] UV[min=%u max=%u]",
-                y_min, y_max, uv_min, uv_max);
-            gst_memory_unmap (encoder->v10conv.output_y.memory, &p010_map);
-            logged_p010_stats = TRUE;
-          }
-        }
-      }
-
-      encoder->fd[0] = encoder->v10conv.output_y.fd;
-      encoder->fd[1] = -1;
-      ui1_plane_num = 1;
-      submit_format = GST_VIDEO_FORMAT_P010_10LE;
-  } else if (is_dmabuf) {
+  if (is_dmabuf) {
       switch (GST_VIDEO_INFO_FORMAT(info)) {
       case GST_VIDEO_FORMAT_NV12:
       case GST_VIDEO_FORMAT_NV21:
-      case GST_VIDEO_FORMAT_P010_10LE:
           {
           /* handle dma case scenario media convet encoder/hdmi rx encoder scenario*/
           encoder->fd[0] = gst_dmabuf_memory_get_fd(memory);
           gst_memory_unref(memory);
-          if (n_mem >= 2) {
-            GstMemory *memory_uv = gst_buffer_get_memory(frame->input_buffer, 1);
-            encoder->fd[1] = gst_dmabuf_memory_get_fd(memory_uv);
-            gst_memory_unref(memory_uv);
-            ui1_plane_num = 2;
-          } else {
-            ui1_plane_num = 1;
-          }
+          GstMemory *memory_uv = gst_buffer_get_memory(frame->input_buffer, 1);
+          encoder->fd[1] = gst_dmabuf_memory_get_fd(memory_uv);
+          gst_memory_unref(memory_uv);
+          ui1_plane_num = 2;
           break;
           }
       default: //hanle I420/YV12/RGB
@@ -1559,22 +1272,10 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
 
   memset(&inbuf_info, 0, sizeof(vl_buffer_info_t));
   inbuf_info.buf_type = DMA_TYPE;
-  inbuf_info.buf_fmt = img_format_convert (submit_format);
-  inbuf_info.buf_stride = (submit_format == GST_VIDEO_FORMAT_P010_10LE) ? info->width * 2 : GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
-  if (inbuf_info.buf_stride <= 0)
-    inbuf_info.buf_stride = info->width;
   inbuf_info.buf_info.dma_info.shared_fd[0] = encoder->fd[0];
   inbuf_info.buf_info.dma_info.shared_fd[1] = encoder->fd[1];
   inbuf_info.buf_info.dma_info.shared_fd[2] = encoder->fd[2];
   inbuf_info.buf_info.dma_info.num_planes = ui1_plane_num;
-  GST_WARNING_OBJECT (encoder,
-      "ENCODER SUBMIT: submit_format=%s -> buf_fmt=%d stride=%d planes=%d fd0=%d fd1=%d width=%d height=%d",
-      gst_video_format_to_string (submit_format),
-      inbuf_info.buf_fmt, inbuf_info.buf_stride,
-      inbuf_info.buf_info.dma_info.num_planes,
-      inbuf_info.buf_info.dma_info.shared_fd[0],
-      inbuf_info.buf_info.dma_info.shared_fd[1],
-      info->width, info->height);
 
   encoding_metadata_t meta =
       vl_multi_encoder_encode(encoder->codec.handle, frame_type,
@@ -1695,18 +1396,6 @@ gst_amlvenc_get_property (GObject * object, guint prop_id,
       struct RoiParamInfo *param_info = retrieve_roi_param_info(encoder, encoder->roi.id);
       g_value_set_int (value, param_info->quality);
     } break;
-    case PROP_INTERNAL_BIT_DEPTH:
-      g_value_set_int (value, encoder->internal_bit_depth);
-      break;
-    case PROP_GOP_PATTERN:
-      g_value_set_int (value, encoder->gop_pattern);
-      break;
-    case PROP_RC_MODE:
-      g_value_set_int (value, encoder->rc_mode);
-      break;
-    case PROP_LOSSLESS_ENABLE:
-      g_value_set_boolean (value, encoder->lossless_enable);
-      break;
     case PROD_ENABLE_DMALLOCATOR:
       g_value_set_boolean (value, encoder->b_enable_dmallocator);
       break;
@@ -1788,18 +1477,6 @@ gst_amlvenc_set_property (GObject * object, guint prop_id,
         roi_set_flag = true;
       }
     } break;
-    case PROP_INTERNAL_BIT_DEPTH:
-      encoder->internal_bit_depth = g_value_get_int (value);
-      break;
-    case PROP_GOP_PATTERN:
-      encoder->gop_pattern = g_value_get_int (value);
-      break;
-    case PROP_RC_MODE:
-      encoder->rc_mode = g_value_get_int (value);
-      break;
-    case PROP_LOSSLESS_ENABLE:
-      encoder->lossless_enable = g_value_get_boolean (value);
-      break;
     case PROD_ENABLE_DMALLOCATOR: {
       gboolean enabled = g_value_get_boolean (value);
       encoder->b_enable_dmallocator = enabled;
