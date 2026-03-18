@@ -1,1 +1,6 @@
-#Dummy
+# Build artifacts
+*.o
+*.so
+*.a
+*.spv
+*.spv.h
