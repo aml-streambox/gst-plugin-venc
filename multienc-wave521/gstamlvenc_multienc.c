@@ -174,15 +174,26 @@ gst_amlvenc_clear_v10conv_buffers (GstAmlVEnc * encoder)
   }
   encoder->v10conv.output_y.fd = -1;
   encoder->v10conv.output_uv.fd = -1;
+  
+  /* Clean up double-buffered outputs */
+  for (int i = 0; i < 2; i++) {
+    if (encoder->v10conv.output_buf[i].memory) {
+      gst_memory_unref (encoder->v10conv.output_buf[i].memory);
+      encoder->v10conv.output_buf[i].memory = NULL;
+    }
+    encoder->v10conv.output_buf[i].fd = -1;
+  }
+  encoder->v10conv.write_idx = 0;
+  encoder->v10conv.pipeline_primed = FALSE;
 }
 
 static gboolean
 gst_amlvenc_prepare_v10conv_buffers (GstAmlVEnc * encoder, const GstVideoInfo * info)
 {
   gsize out_size = info->width * info->height * 3;
-  int out_fd = -1;
 
-  if (encoder->v10conv.output_y.memory)
+  /* Already allocated? */
+  if (encoder->v10conv.output_buf[0].memory)
     return TRUE;
 
   if (!encoder->v10conv.allocator)
@@ -191,28 +202,35 @@ gst_amlvenc_prepare_v10conv_buffers (GstAmlVEnc * encoder, const GstVideoInfo * 
   if (!encoder->v10conv.allocator)
     return FALSE;
 
-  out_fd = gst_amlvenc_alloc_dma_heap_fd (out_size);
-  if (out_fd < 0)
-    goto fail;
+  /* Allocate double-buffered output dmabufs for pipelined GPU+encoder */
+  for (int i = 0; i < 2; i++) {
+    int out_fd = gst_amlvenc_alloc_dma_heap_fd (out_size);
+    if (out_fd < 0)
+      goto fail;
 
-  /*
-   * Use a single contiguous P010 buffer (Y then UV) for Wave521 input.
-   * Some firmware paths interpret IMG_FMT_P010 as one-plane contiguous memory.
-   */
-  encoder->v10conv.output_y.memory =
-      gst_dmabuf_allocator_alloc (encoder->v10conv.allocator,
-      out_fd, out_size);
-  if (!encoder->v10conv.output_y.memory)
-    goto fail;
+    encoder->v10conv.output_buf[i].memory =
+        gst_dmabuf_allocator_alloc (encoder->v10conv.allocator,
+        out_fd, out_size);
+    if (!encoder->v10conv.output_buf[i].memory) {
+      close (out_fd);
+      goto fail;
+    }
 
-  encoder->v10conv.output_y.fd =
-      gst_dmabuf_memory_get_fd (encoder->v10conv.output_y.memory);
+    encoder->v10conv.output_buf[i].fd =
+        gst_dmabuf_memory_get_fd (encoder->v10conv.output_buf[i].memory);
+  }
+
+  /* Also set output_y for backward compat (GLES path, P010 stats logging) */
+  encoder->v10conv.output_y.memory = encoder->v10conv.output_buf[0].memory;
+  gst_memory_ref (encoder->v10conv.output_y.memory);
+  encoder->v10conv.output_y.fd = encoder->v10conv.output_buf[0].fd;
   encoder->v10conv.output_uv.fd = -1;
+
+  encoder->v10conv.write_idx = 0;
+  encoder->v10conv.pipeline_primed = FALSE;
   return TRUE;
 
 fail:
-  if (out_fd >= 0 && !encoder->v10conv.output_y.memory)
-    close (out_fd);
   gst_amlvenc_clear_v10conv_buffers (encoder);
   return FALSE;
 }
@@ -811,6 +829,18 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encode_info.lossless_enable = encoder->lossless_enable;
   encoder->v10conv.enabled = (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_ENCODED);
 
+  /* HDR10 VUI signaling for 10-bit encoded input (BT.2020 + PQ) */
+  if (encoder->v10conv.enabled) {
+    encode_info.vui_parameters_present_flag = 1;
+    encode_info.video_signal_type_present_flag = 1;
+    encode_info.video_full_range_flag = 0;        /* limited/TV range */
+    encode_info.colour_description_present_flag = 1;
+    encode_info.colour_primaries = 9;             /* BT.2020 */
+    encode_info.transfer_characteristics = 16;    /* SMPTE ST 2084 (PQ) */
+    encode_info.matrix_coefficients = 9;          /* BT.2020 non-constant luminance */
+    GST_INFO_OBJECT (encoder, "10-bit HDR10 VUI: BT.2020 + PQ transfer");
+  }
+
   if (encoder->v10conv.enabled) {
       /*
        * Build a virtual P010_10LE video info for proper encoder initialization.
@@ -1259,8 +1289,74 @@ gst_amlvenc_set_format (GstVideoEncoder * video_enc,
 }
 
 static GstFlowReturn
-gst_amlvenc_finish (GstVideoEncoder * encoder)
+gst_amlvenc_finish (GstVideoEncoder * video_enc)
 {
+  GstAmlVEnc *encoder = GST_AMLVENC (video_enc);
+
+  /* Vulkan pipeline: encode the last buffered frame */
+  if (encoder->v10conv.enabled && encoder->v10conv_backend == 0 &&
+      encoder->v10conv.pipeline_primed) {
+
+    GstVideoInfo *info = &encoder->input_state->info;
+
+    /* The last frame's GPU result is in buf[1 - write_idx]
+     * (write_idx was already flipped after the last GPU wait,
+     * so the completed result is in the OTHER buffer).
+     * Actually: write_idx points to where the NEXT GPU submit would go.
+     * The last completed GPU result is in buf[1 - write_idx]. */
+    gint last_buf = 1 - encoder->v10conv.write_idx;
+    int last_fd = encoder->v10conv.output_buf[last_buf].fd;
+
+    GST_WARNING_OBJECT(encoder, "Vulkan pipeline flush: encoding last buffered frame from buf[%d] fd=%d",
+        last_buf, last_fd);
+
+    vl_buffer_info_t inbuf_info;
+    vl_buffer_info_t retbuf_info;
+    memset(&inbuf_info, 0, sizeof(vl_buffer_info_t));
+    inbuf_info.buf_type = DMA_TYPE;
+    inbuf_info.buf_fmt = img_format_convert(GST_VIDEO_FORMAT_P010_10LE);
+    inbuf_info.buf_stride = info->width * 2;
+    inbuf_info.buf_info.dma_info.shared_fd[0] = last_fd;
+    inbuf_info.buf_info.dma_info.shared_fd[1] = -1;
+    inbuf_info.buf_info.dma_info.shared_fd[2] = -1;
+    inbuf_info.buf_info.dma_info.num_planes = 1;
+
+    encoding_metadata_t meta =
+        vl_multi_encoder_encode(encoder->codec.handle, FRAME_TYPE_AUTO,
+                                encoder->codec.buf, &inbuf_info, &retbuf_info);
+
+    if (meta.is_valid) {
+      GstVideoCodecFrame *frame =
+          gst_video_encoder_get_oldest_frame(video_enc);
+      if (frame) {
+        GstMapInfo map;
+        frame->output_buffer = gst_video_encoder_allocate_output_buffer(
+            video_enc, meta.encoded_data_length_in_bytes);
+        gst_buffer_map(frame->output_buffer, &map, GST_MAP_WRITE);
+        memcpy(map.data, encoder->codec.buf, meta.encoded_data_length_in_bytes);
+        gst_buffer_unmap(frame->output_buffer, &map);
+
+        if ((GST_CLOCK_TIME_NONE == GST_BUFFER_TIMESTAMP(frame->input_buffer))
+            && info->fps_n && info->fps_d) {
+          GST_BUFFER_TIMESTAMP(frame->input_buffer) = gst_util_uint64_scale(
+              encoder->u4_first_pts_index++, GST_SECOND, info->fps_n / info->fps_d);
+          GST_BUFFER_DURATION(frame->input_buffer) = gst_util_uint64_scale(
+              1, GST_SECOND, info->fps_n / info->fps_d);
+          frame->pts = GST_BUFFER_TIMESTAMP(frame->input_buffer);
+        }
+        frame->dts = frame->pts;
+
+        GST_WARNING_OBJECT(encoder, "Vulkan pipeline flush: finishing last frame pts=%" G_GINT64_FORMAT,
+            (gint64)frame->pts);
+        gst_video_encoder_finish_frame(video_enc, frame);
+      }
+    } else {
+      GST_WARNING_OBJECT(encoder, "Vulkan pipeline flush: last frame encode returned invalid metadata");
+    }
+
+    encoder->v10conv.pipeline_primed = FALSE;
+  }
+
   return GST_FLOW_OK;
 }
 
@@ -1380,6 +1476,7 @@ static GstFlowReturn
 gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
     GstVideoCodecFrame * frame)
 {
+  gint64 t_frame_start = g_get_monotonic_time();
   vl_frame_type_t frame_type = FRAME_TYPE_AUTO;
   GstVideoInfo *info = &encoder->input_state->info;
   GstMapInfo map;
@@ -1428,7 +1525,16 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
       gint64 t_conv_start = g_get_monotonic_time();
       
       if (encoder->v10conv_backend == 0) {
-        /* Vulkan backend (default) — uses cached dmabuf imports internally */
+        /* Vulkan backend — double-buffered pipeline with 1-frame delay
+         *
+         * Frame 0 (priming): GPU convert to buf[0], return early (no encode).
+         * Frame N (N>=1): GPU submit frame N to buf[N%2] (non-blocking),
+         *   encode frame N-1 from buf[(N-1)%2] while GPU runs in parallel,
+         *   wait for frame N's GPU.
+         * EOS (finish): encode last buffered frame.
+         *
+         * Throughput: max(GPU, encoder) = ~13ms/frame instead of sum = ~21.5ms.
+         */
         static gboolean vulkan_initialized = FALSE;
         if (!vulkan_initialized) {
           if (yuv422_vulkan_init(info->width, info->height) == 0) {
@@ -1440,14 +1546,61 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
             return GST_FLOW_ERROR;
           }
         }
-        
-        /* Pass original fds — Vulkan caches imports and dup()s internally */
-        if (yuv422_vulkan_convert_dmabuf(in_fd,
-                encoder->v10conv.output_y.fd,
-                info->width, info->height) != 0) {
-          GST_ERROR_OBJECT(encoder, "Vulkan conversion failed (%s)",
-              yuv422_vulkan_last_error());
-          return GST_FLOW_ERROR;
+
+        gint cur = encoder->v10conv.write_idx;
+        int out_fd = encoder->v10conv.output_buf[cur].fd;
+
+        if (!encoder->v10conv.pipeline_primed) {
+          /* === FRAME 0: Prime the pipeline === */
+          /* Synchronous GPU convert, then return early without encoding.
+           * The next handle_frame call will encode this result. */
+          if (yuv422_vulkan_convert_dmabuf(in_fd, out_fd,
+                  info->width, info->height) != 0) {
+            GST_ERROR_OBJECT(encoder, "Vulkan conversion failed on first frame (%s)",
+                yuv422_vulkan_last_error());
+            return GST_FLOW_ERROR;
+          }
+          gint64 conv_us = g_get_monotonic_time() - t_conv_start;
+          GST_WARNING_OBJECT(encoder, "[ENC-PROF] Vulkan conversion (priming, sync): %" G_GINT64_FORMAT " us (%.2f ms)",
+              conv_us, conv_us / 1000.0);
+
+          encoder->v10conv.pipeline_primed = TRUE;
+          /* write_idx stays at cur — next frame will submit to buf[1-cur]
+           * and encode from buf[cur] */
+          encoder->v10conv.write_idx = 1 - cur;
+
+          /* DON'T encode — return early. Frame 0 stays in GStreamer's
+           * pending frame queue; it will be finished when frame 1 arrives. */
+          GST_WARNING_OBJECT(encoder, "Vulkan pipeline primed — skipping encode for first frame");
+          gst_video_codec_frame_unref(frame);
+          return GST_FLOW_OK;
+        } else {
+          /* === FRAME N (N>=1): Pipelined GPU + encode === */
+          gint encode_buf = 1 - cur;  /* previous frame's GPU result */
+          int encode_fd = encoder->v10conv.output_buf[encode_buf].fd;
+
+          /* 1. Submit GPU for frame N (non-blocking) */
+          if (yuv422_vulkan_convert_submit(in_fd, out_fd,
+                  info->width, info->height) != 0) {
+            GST_ERROR_OBJECT(encoder, "Vulkan submit failed (%s)",
+                yuv422_vulkan_last_error());
+            return GST_FLOW_ERROR;
+          }
+
+          gint64 conv_us = g_get_monotonic_time() - t_conv_start;
+          GST_WARNING_OBJECT(encoder, "[ENC-PROF] Vulkan submit (pipelined): %" G_GINT64_FORMAT " us (%.2f ms)",
+              conv_us, conv_us / 1000.0);
+
+          /* 2. Set encoder to use PREVIOUS frame's GPU result.
+           * The encoder will run for ~13ms, during which frame N's GPU
+           * conversion runs in parallel on the Mali GPU. */
+          encoder->fd[0] = encode_fd;
+          encoder->fd[1] = -1;
+          ui1_plane_num = 1;
+          submit_format = GST_VIDEO_FORMAT_P010_10LE;
+
+          /* Skip P010 stats logging for pipelined frames — go to encoder */
+          goto v10conv_pipeline_encode;
         }
       } else {
         /* GLES backend */
@@ -1470,15 +1623,19 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
         }
       }
       
-      gint64 conv_us = g_get_monotonic_time() - t_conv_start;
-      GST_WARNING_OBJECT(encoder, "[ENC-PROF] %s conversion: %" G_GINT64_FORMAT " us (%.2f ms)",
-          encoder->v10conv_backend == 0 ? "Vulkan" : "GLES",
-          conv_us, conv_us / 1000.0);
+      /* GLES profiling */
+      {
+        gint64 conv_us_gles = g_get_monotonic_time() - t_conv_start;
+        GST_WARNING_OBJECT(encoder, "[ENC-PROF] GLES conversion: %" G_GINT64_FORMAT " us (%.2f ms)",
+            conv_us_gles, conv_us_gles / 1000.0);
+      }
+
+      encoder->fd[0] = encoder->v10conv.output_y.fd;
+      encoder->fd[1] = -1;
+      ui1_plane_num = 1;
+      submit_format = GST_VIDEO_FORMAT_P010_10LE;
 
       /* GPU shader outputs Wave521 MSB format directly - no CPU repack needed */
-
-      /* CRITICAL: Override submit format to P010_10LE since we just converted to it */
-      submit_format = GST_VIDEO_FORMAT_P010_10LE;
       GST_WARNING_OBJECT (encoder,
           "v10conv submit override: submit_format=%d (P010_10LE), width=%d, height=%d, stride=%d",
           submit_format, info->width, info->height, info->width * 2);
@@ -1489,13 +1646,14 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
           /* Sync dmabuf for CPU read — invalidate cache to see GPU writes */
           struct dma_buf_sync sync_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
           struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
-          int sync_fd = gst_dmabuf_memory_get_fd(encoder->v10conv.output_y.memory);
+          int sync_fd = encoder->fd[0];
           if (sync_fd >= 0) {
             ioctl(sync_fd, DMA_BUF_IOCTL_SYNC, &sync_start);
           }
 
           GstMapInfo p010_map;
-          if (gst_memory_map (encoder->v10conv.output_y.memory, &p010_map, GST_MAP_READ)) {
+          GstMemory *stats_mem = encoder->v10conv.output_buf[0].memory;
+          if (stats_mem && gst_memory_map (stats_mem, &p010_map, GST_MAP_READ)) {
             guint y_samples = MIN ((guint)(info->width * info->height), 4096u);
             guint uv_samples = MIN ((guint)(info->width * info->height / 2), 4096u);
             guint y_min = 0xffff, y_max = 0;
@@ -1519,7 +1677,7 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
             GST_WARNING_OBJECT (encoder,
                 "internal P010 sample stats: Y[min=%u max=%u] UV[min=%u max=%u]",
                 y_min, y_max, uv_min, uv_max);
-            gst_memory_unmap (encoder->v10conv.output_y.memory, &p010_map);
+            gst_memory_unmap (stats_mem, &p010_map);
             logged_p010_stats = TRUE;
           }
 
@@ -1529,13 +1687,9 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
         }
       }
 
-      /* Use ORIGINAL fd for encoder - Vulkan owns the dup'd fd and will close it.
-       * The original fd remains valid as long as GstMemory is alive.
-       */
-      encoder->fd[0] = encoder->v10conv.output_y.fd;
-      encoder->fd[1] = -1;
-      ui1_plane_num = 1;
-      submit_format = GST_VIDEO_FORMAT_P010_10LE;
+v10conv_pipeline_encode:
+      /* Reached by: all v10conv paths. encoder->fd[0] is set to the correct output buffer. */
+      ;
   } else if (is_dmabuf) {
       switch (GST_VIDEO_INFO_FORMAT(info)) {
       case GST_VIDEO_FORMAT_NV12:
@@ -1656,15 +1810,39 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
       inbuf_info.buf_info.dma_info.shared_fd[1],
       info->width, info->height);
 
+  gint64 t_enc_start = g_get_monotonic_time();
   encoding_metadata_t meta =
       vl_multi_encoder_encode(encoder->codec.handle, frame_type,
                               encoder->codec.buf, &inbuf_info, &retbuf_info);
+  gint64 enc_us = g_get_monotonic_time() - t_enc_start;
+  GST_WARNING_OBJECT(encoder, "[ENC-PROF] encoder: %" G_GINT64_FORMAT " us (%.2f ms)",
+      enc_us, enc_us / 1000.0);
 
   /* Close GLES dup'd output fd after encoding completes */
   if (encoder->v10conv.enabled && encoder->v10conv_backend == 1 &&
       encoder->v10conv.output_y.fd_dup >= 0) {
     close(encoder->v10conv.output_y.fd_dup);
     encoder->v10conv.output_y.fd_dup = -1;
+  }
+
+  /* Vulkan pipeline: wait for current frame's GPU work (submitted earlier).
+   * During the encoder call above (~13ms), the GPU was converting the NEXT
+   * frame in parallel. By now (~13ms later) it should be done (only ~8.5ms). */
+  if (encoder->v10conv.enabled && encoder->v10conv_backend == 0 &&
+      encoder->v10conv.pipeline_primed) {
+    gint64 t_gpu_wait = g_get_monotonic_time();
+    if (yuv422_vulkan_convert_wait() != 0) {
+      GST_ERROR_OBJECT(encoder, "Vulkan pipeline wait failed (%s)",
+          yuv422_vulkan_last_error());
+      /* Non-fatal — GPU result for NEXT frame is bad, but current encode succeeded */
+    }
+    gint64 gpu_wait_us = g_get_monotonic_time() - t_gpu_wait;
+    GST_WARNING_OBJECT(encoder, "[ENC-PROF] Vulkan pipeline wait after encoder: %" G_GINT64_FORMAT " us (%.2f ms)",
+        gpu_wait_us, gpu_wait_us / 1000.0);
+
+    /* Flip double-buffer index — frame N's GPU result is now in buf[write_idx],
+     * ready to be encoded next time. Next frame will write into buf[1-write_idx]. */
+    encoder->v10conv.write_idx = 1 - encoder->v10conv.write_idx;
   }
 
   if (!meta.is_valid) {
@@ -1724,6 +1902,12 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
     GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
   } else {
     GST_VIDEO_CODEC_FRAME_UNSET_SYNC_POINT (frame);
+  }
+
+  {
+    gint64 frame_us = g_get_monotonic_time() - t_frame_start;
+    GST_WARNING_OBJECT(encoder, "[ENC-PROF] total frame: %" G_GINT64_FORMAT " us (%.2f ms)",
+        frame_us, frame_us / 1000.0);
   }
 
   return gst_video_encoder_finish_frame ( GST_VIDEO_ENCODER(encoder), frame);

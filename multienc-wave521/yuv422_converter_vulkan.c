@@ -109,6 +109,10 @@ typedef struct {
     
     /* Track which input cache entry is active this frame */
     int active_input_idx;  /* index into input_cache[], or -1 */
+    
+    /* Pending submit state for split submit/wait API */
+    int pending_in_fd;     /* input fd needing DMA_BUF_SYNC_END after wait, or -1 */
+    int has_pending;       /* 1 if a submit is in-flight awaiting wait */
 } VulkanCtx;
 
 static VulkanCtx ctx = {0};
@@ -619,16 +623,15 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
 }
 
 /* =============================================================================
- * Synchronous Conversion (Blocking) — Optimized
+ * Non-blocking Submit — dispatches GPU work, returns immediately
  * ============================================================================= */
 
-int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t height) {
+int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t height) {
     if (!ctx.initialized) {
         snprintf(ctx.last_error, sizeof(ctx.last_error), "Vulkan not initialized");
         return -1;
     }
     
-    double t_start = now_ms();
     VkResult result;
     
     /* Fence management */
@@ -775,13 +778,39 @@ int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t
     result = vkQueueSubmit(ctx.compute_queue, 1, &submit_info, ctx.fences[0]);
     VK_CHECK(result, "vkQueueSubmit");
     
-    /* Wait for GPU */
-    result = vkWaitForFences(ctx.device, 1, &ctx.fences[0], VK_TRUE, 5000000000ULL);
+    /* Track pending state for the wait call */
+    ctx.pending_in_fd = in_fd;
+    ctx.has_pending = 1;
+    
+    return 0;
+}
+
+/* =============================================================================
+ * Wait for previously submitted GPU work to complete
+ * ============================================================================= */
+
+int yuv422_vulkan_convert_wait(void) {
+    if (!ctx.initialized) {
+        snprintf(ctx.last_error, sizeof(ctx.last_error), "Vulkan not initialized");
+        return -1;
+    }
+    
+    if (!ctx.has_pending) {
+        /* Nothing to wait for */
+        return 0;
+    }
+    
+    VkResult result = vkWaitForFences(ctx.device, 1, &ctx.fences[0], VK_TRUE, 5000000000ULL);
     
     /* DMA_BUF_SYNC_END(READ) — release our read access to the input dmabuf
      * so the capture device can write new frame data to it */
-    struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
-    ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+    if (ctx.pending_in_fd >= 0) {
+        struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
+        ioctl(ctx.pending_in_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+    }
+    
+    ctx.has_pending = 0;
+    ctx.pending_in_fd = -1;
     
     if (result != VK_SUCCESS) {
         snprintf(ctx.last_error, sizeof(ctx.last_error), "vkWaitForFences failed: %d (frame %lu)", result, (unsigned long)ctx.frame_count);
@@ -790,11 +819,27 @@ int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t
     }
     
     vkResetFences(ctx.device, 1, &ctx.fences[0]);
-    
     ctx.frame_count++;
-    double elapsed = now_ms() - t_start;
+    
+    return 0;
+}
+
+/* =============================================================================
+ * Synchronous Conversion (Blocking) — convenience wrapper
+ * ============================================================================= */
+
+int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t height) {
+    double t_start = now_ms();
+    
+    int ret = yuv422_vulkan_convert_submit(in_fd, out_fd, width, height);
+    if (ret != 0) return ret;
+    
+    ret = yuv422_vulkan_convert_wait();
+    if (ret != 0) return ret;
+    
 #if VULKAN_DEBUG
-    fprintf(stderr, "[VULKAN-PROF] Convert frame %lu: %.3f ms (CACHED+SYNC)\n", (unsigned long)(ctx.frame_count - 1), elapsed);
+    double elapsed = now_ms() - t_start;
+    fprintf(stderr, "[VULKAN-PROF] Convert frame %lu: %.3f ms (SYNC)\n", (unsigned long)(ctx.frame_count - 1), elapsed);
 #endif
     
     return 0;

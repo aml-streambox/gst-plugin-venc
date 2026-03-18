@@ -1,6 +1,16 @@
 #!/bin/bash
-# Compile GLSL compute shader to SPIR-V
-# Requires glslangValidator from KhronosGroup/glslang
+# Compile GLSL compute shader to SPIR-V and generate a C header.
+#
+# This script produces yuv422_to_p010_spv.h which is #include'd by
+# yuv422_converter_vulkan.c.  You MUST re-run this script after any
+# change to yuv422_to_p010.comp, then rebuild the plugin:
+#
+#   bash compile_shader.sh
+#   rm -f yuv422_converter_vulkan.o   # force recompile
+#   bitbake gst-plugin-venc-multienc -f -c compile
+#
+# Requires glslangValidator (from KhronosGroup/glslang) or glslc
+# (from the Vulkan SDK), plus xxd.
 
 INPUT="yuv422_to_p010.comp"
 OUTPUT="yuv422_to_p010.spv"

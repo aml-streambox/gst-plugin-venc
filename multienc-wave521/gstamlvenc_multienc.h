@@ -71,6 +71,13 @@ struct _GstAmlVEnc
       gint fd;
       gint fd_dup;  /* dup'd fd we own, valid during encoding */
     } output_y, output_uv;
+    /* Double-buffered output for pipelined GPU+encoder */
+    struct {
+      GstMemory *memory;
+      gint fd;
+    } output_buf[2];
+    gint write_idx;       /* next buffer for GPU to write into (0 or 1) */
+    gboolean pipeline_primed; /* TRUE after first frame's GPU work submitted */
   } v10conv;
 
   GstAllocator *dmabuf_alloc;

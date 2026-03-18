@@ -35,6 +35,17 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height);
  */
 int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t height);
 
+/* Non-blocking submit — dispatches GPU work, returns immediately.
+ * Must call yuv422_vulkan_convert_wait() before the next submit.
+ * Returns 0 on success, -1 on failure.
+ */
+int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t height);
+
+/* Wait for previously submitted GPU work to complete.
+ * Returns 0 on success (or if nothing pending), -1 on failure.
+ */
+int yuv422_vulkan_convert_wait(void);
+
 /* Release output resources after encoder is done
  * 
  * Call this after the encoder has finished reading the output dmabuf.
