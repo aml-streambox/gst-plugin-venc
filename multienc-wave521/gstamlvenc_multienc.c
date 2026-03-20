@@ -40,6 +40,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
+#include <signal.h>
+#include <glib-unix.h>
 
 #include "gstamlvenc_multienc.h"
 #include "imgproc.h"
@@ -686,19 +688,54 @@ gst_amlvenc_init (GstAmlVEnc * encoder)
 
   encoder->u4_first_pts_index = 0;
   encoder->b_enable_dmallocator = TRUE;
+
+  encoder->stopping = FALSE;
+  encoder->sigint_source_id = 0;
+  g_mutex_init (&encoder->encoder_lock);
 }
 
 static void
 gst_amlvenc_finalize (GObject * object)
 {
+  GstAmlVEnc *encoder = GST_AMLVENC (object);
+  g_mutex_clear (&encoder->encoder_lock);
   G_OBJECT_CLASS (parent_class)->finalize (object);
 }
 
+
+/* ---- SIGUSR1-driven EOS injection ---- */
+
+static gboolean
+gst_amlvenc_sigusr1_handler (gpointer user_data)
+{
+  GstAmlVEnc *encoder = GST_AMLVENC (user_data);
+
+  GST_WARNING_OBJECT (encoder,
+      "SIGUSR1 caught by amlvenc — injecting EOS for clean encoder shutdown");
+
+  /* Set stopping flag so encode paths bail out immediately */
+  encoder->stopping = TRUE;
+
+  /* Inject EOS on the encoder element.
+   * This arrives on the sink pad, causing the GstVideoEncoder base class
+   * to call our finish() vfunc for a clean flush, then propagates
+   * downstream so the whole pipeline shuts down gracefully.
+   * This bypasses any blocked upstream element (e.g. v4l2src in poll/DQBUF). */
+  gst_element_send_event (GST_ELEMENT (encoder), gst_event_new_eos ());
+
+  /* Invalidate the source ID — this callback won't run again */
+  encoder->sigint_source_id = 0;
+
+  return G_SOURCE_REMOVE;
+}
 
 static gboolean
 gst_amlvenc_start (GstVideoEncoder * encoder)
 {
   GstAmlVEnc *venc = GST_AMLVENC (encoder);
+
+  /* Reset stopping flag for fresh pipeline run */
+  venc->stopping = FALSE;
 
   venc->dmabuf_alloc = gst_amlion_allocator_obtain();
 
@@ -719,6 +756,16 @@ gst_amlvenc_start (GstVideoEncoder * encoder)
      this is probably overkill for most streams */
   gst_video_encoder_set_min_pts (encoder, GST_MSECOND * 30);
 
+  /* Install SIGUSR1 handler so the pipeline manager can trigger a clean EOS
+   * shutdown that bypasses any blocked upstream element (e.g. v4l2src).
+   * SIGUSR1 is used instead of SIGINT to avoid interfering with GStreamer's
+   * own Ctrl+C / SIGINT handling in gst-launch-1.0 -e.
+   * g_unix_signal_add uses an internal pipe — safe from signal context. */
+  venc->sigint_source_id = g_unix_signal_add (SIGUSR1,
+      gst_amlvenc_sigusr1_handler, venc);
+  GST_WARNING_OBJECT (venc, "start: installed SIGUSR1 handler (source_id=%u)",
+      venc->sigint_source_id);
+
   return TRUE;
 }
 
@@ -726,6 +773,16 @@ static gboolean
 gst_amlvenc_stop (GstVideoEncoder * encoder)
 {
   GstAmlVEnc *venc = GST_AMLVENC (encoder);
+
+  /* Signal all blocking paths to bail out */
+  venc->stopping = TRUE;
+  GST_WARNING_OBJECT (venc, "stop: setting stopping flag, closing encoder");
+
+  /* Remove SIGUSR1 handler to avoid firing after encoder is torn down */
+  if (venc->sigint_source_id) {
+    g_source_remove (venc->sigint_source_id);
+    venc->sigint_source_id = 0;
+  }
 
   gst_amlvenc_close_encoder (venc);
 
@@ -1293,6 +1350,16 @@ gst_amlvenc_finish (GstVideoEncoder * video_enc)
 {
   GstAmlVEnc *encoder = GST_AMLVENC (video_enc);
 
+  GST_WARNING_OBJECT (encoder, "finish: EOS received, flushing encoder (stopping=%d)",
+      encoder->stopping);
+
+  /* Guard: if the encoder handle is already gone, nothing to flush */
+  if (G_UNLIKELY (encoder->codec.handle == 0)) {
+    GST_WARNING_OBJECT (encoder, "finish: codec handle is NULL, skipping flush");
+    encoder->v10conv.pipeline_primed = FALSE;
+    return GST_FLOW_OK;
+  }
+
   /* Vulkan pipeline: encode the last buffered frame */
   if (encoder->v10conv.enabled && encoder->v10conv_backend == 0 &&
       encoder->v10conv.pipeline_primed) {
@@ -1456,6 +1523,12 @@ gst_amlvenc_handle_frame (GstVideoEncoder * video_enc,
   GstAmlVEnc *encoder = GST_AMLVENC (video_enc);
   GstFlowReturn ret;
 
+  if (G_UNLIKELY (encoder->stopping)) {
+    GST_WARNING_OBJECT (encoder, "handle_frame: stopping flag set, dropping frame");
+    gst_video_codec_frame_unref (frame);
+    return GST_FLOW_FLUSHING;
+  }
+
   if (G_UNLIKELY (encoder->codec.handle == 0))
     goto not_inited;
 
@@ -1483,6 +1556,13 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
   guint8 ui1_plane_num = 1;
   gint encode_data_len = -1;
   gint fd = -1;
+
+  if (G_UNLIKELY (encoder->stopping)) {
+    GST_WARNING_OBJECT (encoder, "encode_frame: stopping flag set, aborting");
+    if (frame)
+      gst_video_codec_frame_unref (frame);
+    return GST_FLOW_FLUSHING;
+  }
 
   if (G_UNLIKELY (encoder->codec.handle == 0)) {
     if (frame)
@@ -1809,6 +1889,14 @@ v10conv_pipeline_encode:
       inbuf_info.buf_info.dma_info.shared_fd[0],
       inbuf_info.buf_info.dma_info.shared_fd[1],
       info->width, info->height);
+
+  /* Last chance to bail before entering the blocking encoder call */
+  if (G_UNLIKELY (encoder->stopping)) {
+    GST_WARNING_OBJECT (encoder, "encode_frame: stopping flag set before encoder call, aborting");
+    if (frame)
+      gst_video_codec_frame_unref (frame);
+    return GST_FLOW_FLUSHING;
+  }
 
   gint64 t_enc_start = g_get_monotonic_time();
   encoding_metadata_t meta =

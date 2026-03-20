@@ -118,6 +118,13 @@ struct _GstAmlVEnc
   /* input description */
   GstVideoCodecState *input_state;
 
+  /* abort/shutdown mechanism for clean pipeline teardown */
+  volatile gboolean stopping;
+  GMutex encoder_lock;  /* protects codec.handle access during shutdown */
+
+  /* SIGINT-driven EOS: encoder self-injects EOS on Ctrl+C */
+  guint sigint_source_id;
+
 };
 
 struct _GstAmlVEncClass
