@@ -884,6 +884,7 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encode_info.gop_pattern = encoder->gop_pattern;
   encode_info.rc_mode = encoder->rc_mode;
   encode_info.lossless_enable = encoder->lossless_enable;
+  encode_info.bitstream_buf_sz_kb = encoder->encoder_bufsize / 1024;
   encoder->v10conv.enabled = (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_ENCODED);
 
   /* HDR10 VUI signaling for 10-bit encoded input (BT.2020 + PQ) */
@@ -934,7 +935,7 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   }
 
   GST_WARNING_OBJECT (encoder,
-      "init encoder request: codec=%d format=%s %dx%d fps=%d bitrate=%d gop=%d depth=%d roi=%d min=%d max=%d dmalloc=%d gop_pattern=%d rc_mode=%d lossless=%d v10conv=%d",
+      "init encoder request: codec=%d format=%s %dx%d fps=%d bitrate=%d gop=%d depth=%d roi=%d min=%d max=%d dmalloc=%d gop_pattern=%d rc_mode=%d lossless=%d v10conv=%d bs_buf=%dKB",
       encoder->codec.id,
       gst_video_format_to_string (GST_VIDEO_INFO_FORMAT (info)),
       info->width, info->height,
@@ -949,7 +950,8 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
       encoder->gop_pattern,
       encoder->rc_mode,
       encoder->lossless_enable ? 1 : 0,
-      encoder->v10conv.enabled ? 1 : 0);
+      encoder->v10conv.enabled ? 1 : 0,
+      (int)encode_info.bitstream_buf_sz_kb);
 
   qp_param_t qp_tbl;
   memset(&qp_tbl, 0, sizeof(qp_param_t));
