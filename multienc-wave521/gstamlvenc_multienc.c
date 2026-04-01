@@ -39,6 +39,7 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <stdio.h>
 #include <string.h>
 #include <signal.h>
 #include <glib-unix.h>
@@ -187,6 +188,12 @@ gst_amlvenc_clear_v10conv_buffers (GstAmlVEnc * encoder)
   }
   encoder->v10conv.write_idx = 0;
   encoder->v10conv.pipeline_primed = FALSE;
+
+  /* Clean up Vulkan GPU resources if initialized */
+  if (encoder->v10conv.vulkan_initialized) {
+    yuv422_vulkan_cleanup();
+    encoder->v10conv.vulkan_initialized = FALSE;
+  }
 }
 
 static gboolean
@@ -887,16 +894,42 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encode_info.bitstream_buf_sz_kb = encoder->encoder_bufsize / 1024;
   encoder->v10conv.enabled = (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_ENCODED);
 
-  /* HDR10 VUI signaling for 10-bit encoded input (BT.2020 + PQ) */
-  if (encoder->v10conv.enabled) {
-    encode_info.vui_parameters_present_flag = 1;
-    encode_info.video_signal_type_present_flag = 1;
-    encode_info.video_full_range_flag = 0;        /* limited/TV range */
-    encode_info.colour_description_present_flag = 1;
-    encode_info.colour_primaries = 9;             /* BT.2020 */
-    encode_info.transfer_characteristics = 16;    /* SMPTE ST 2084 (PQ) */
-    encode_info.matrix_coefficients = 9;          /* BT.2020 non-constant luminance */
-    GST_INFO_OBJECT (encoder, "10-bit HDR10 VUI: BT.2020 + PQ transfer");
+  /* VUI color signaling: read colorimetry from incoming caps and convert to
+   * ITU-T H.273 integer codes for the H.264/H.265 SPS VUI.  This covers all
+   * input paths — standard video formats carrying colorimetry in caps as well
+   * as the v10conv (ENCODED) path where we fall back to BT.2020+PQ. */
+  {
+    GstVideoColorimetry *cinfo = &info->colorimetry;
+    guint cp = gst_video_color_primaries_to_iso (cinfo->primaries);
+    guint tc = gst_video_transfer_function_to_iso (cinfo->transfer);
+    guint mc = gst_video_color_matrix_to_iso (cinfo->matrix);
+
+    /* v10conv path: caps carry ENCODED format so GstVideoInfo won't have
+     * useful colorimetry — default to BT.2020 + PQ (HDR10). */
+    if (encoder->v10conv.enabled && cp == 0 && tc == 0 && mc == 0) {
+      cp = 9;   /* BT.2020 */
+      tc = 16;  /* SMPTE ST 2084 (PQ) */
+      mc = 9;   /* BT.2020 non-constant luminance */
+      GST_INFO_OBJECT (encoder,
+          "v10conv path: no colorimetry in caps, defaulting to BT.2020 + PQ");
+    }
+
+    if (cp != 0 || tc != 0 || mc != 0) {
+      encode_info.vui_parameters_present_flag = 1;
+      encode_info.video_signal_type_present_flag = 1;
+      encode_info.video_full_range_flag =
+          (cinfo->range == GST_VIDEO_COLOR_RANGE_0_255) ? 1 : 0;
+      encode_info.colour_description_present_flag = 1;
+      encode_info.colour_primaries = (uint8_t) cp;
+      encode_info.transfer_characteristics = (uint8_t) tc;
+      encode_info.matrix_coefficients = (uint8_t) mc;
+      GST_INFO_OBJECT (encoder,
+          "VUI signaling: primaries=%u transfer=%u matrix=%u range=%d",
+          cp, tc, mc, encode_info.video_full_range_flag);
+    } else {
+      GST_DEBUG_OBJECT (encoder,
+          "No colorimetry in caps, VUI will not be signaled");
+    }
   }
 
   if (encoder->v10conv.enabled) {
@@ -1114,10 +1147,12 @@ idle_set_roi(GstAmlVEnc * self) {
 static void
 gst_amlvenc_close_encoder (GstAmlVEnc * encoder)
 {
+  g_mutex_lock (&encoder->encoder_lock);
   if (encoder->codec.handle != 0) {
     vl_multi_encoder_destroy(encoder->codec.handle);
     encoder->codec.handle = 0;
   }
+  g_mutex_unlock (&encoder->encoder_lock);
   if (encoder->imgproc.handle) {
     imgproc_deinit(encoder->imgproc.handle);
     encoder->imgproc.handle = NULL;
@@ -1270,7 +1305,8 @@ gst_amlvenc_set_format (GstVideoEncoder * video_enc,
     if (info->finfo->format == old->finfo->format
         && info->width == old->width && info->height == old->height
         && info->fps_n == old->fps_n && info->fps_d == old->fps_d
-        && info->par_n == old->par_n && info->par_d == old->par_d) {
+        && info->par_n == old->par_n && info->par_d == old->par_d
+        && gst_video_colorimetry_is_equal (&info->colorimetry, &old->colorimetry)) {
       gst_video_codec_state_unref (encoder->input_state);
       encoder->input_state = gst_video_codec_state_ref (state);
       return TRUE;
@@ -1390,9 +1426,17 @@ gst_amlvenc_finish (GstVideoEncoder * video_enc)
     inbuf_info.buf_info.dma_info.shared_fd[2] = -1;
     inbuf_info.buf_info.dma_info.num_planes = 1;
 
+    g_mutex_lock (&encoder->encoder_lock);
+    if (G_UNLIKELY (encoder->codec.handle == 0)) {
+      g_mutex_unlock (&encoder->encoder_lock);
+      GST_WARNING_OBJECT(encoder, "Vulkan pipeline flush: codec handle destroyed, skipping");
+      encoder->v10conv.pipeline_primed = FALSE;
+      return GST_FLOW_OK;
+    }
     encoding_metadata_t meta =
         vl_multi_encoder_encode(encoder->codec.handle, FRAME_TYPE_AUTO,
                                 encoder->codec.buf, &inbuf_info, &retbuf_info);
+    g_mutex_unlock (&encoder->encoder_lock);
 
     if (meta.is_valid) {
       GstVideoCodecFrame *frame =
@@ -1551,6 +1595,7 @@ static GstFlowReturn
 gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
     GstVideoCodecFrame * frame)
 {
+  static unsigned long dbg_frame_num = 0;
   gint64 t_frame_start = g_get_monotonic_time();
   vl_frame_type_t frame_type = FRAME_TYPE_AUTO;
   GstVideoInfo *info = &encoder->input_state->info;
@@ -1617,10 +1662,9 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
          *
          * Throughput: max(GPU, encoder) = ~13ms/frame instead of sum = ~21.5ms.
          */
-        static gboolean vulkan_initialized = FALSE;
-        if (!vulkan_initialized) {
+        if (!encoder->v10conv.vulkan_initialized) {
           if (yuv422_vulkan_init(info->width, info->height) == 0) {
-            vulkan_initialized = TRUE;
+            encoder->v10conv.vulkan_initialized = TRUE;
             GST_WARNING_OBJECT(encoder, "Vulkan converter initialized successfully");
           } else {
             GST_ERROR_OBJECT(encoder, "Vulkan init failed (%s)",
@@ -1651,11 +1695,16 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
            * and encode from buf[cur] */
           encoder->v10conv.write_idx = 1 - cur;
 
-          /* DON'T encode — return early. Frame 0 stays in GStreamer's
-           * pending frame queue; it will be finished when frame 1 arrives. */
-          GST_WARNING_OBJECT(encoder, "Vulkan pipeline primed — skipping encode for first frame");
-          gst_video_codec_frame_unref(frame);
-          return GST_FLOW_OK;
+          /* DON'T encode — drop this frame from GstVideoEncoder's pending
+           * queue so its input buffer is released back to the upstream pool.
+           * Previously we only called gst_video_codec_frame_unref() which
+           * does NOT remove the frame from the pending list, causing the
+           * input DMA-buf to stay pinned and eventually exhausting the
+           * upstream buffer pool (pipeline stall after ~4 frames). */
+          GST_WARNING_OBJECT(encoder, "Vulkan pipeline primed — dropping frame 0 (no encode)");
+          frame->output_buffer = gst_buffer_new();
+          GST_VIDEO_CODEC_FRAME_SET_DECODE_ONLY(frame);
+          return gst_video_encoder_finish_frame(GST_VIDEO_ENCODER(encoder), frame);
         } else {
           /* === FRAME N (N>=1): Pipelined GPU + encode === */
           gint encode_buf = 1 - cur;  /* previous frame's GPU result */
@@ -1883,6 +1932,7 @@ v10conv_pipeline_encode:
   inbuf_info.buf_info.dma_info.shared_fd[1] = encoder->fd[1];
   inbuf_info.buf_info.dma_info.shared_fd[2] = encoder->fd[2];
   inbuf_info.buf_info.dma_info.num_planes = ui1_plane_num;
+
   GST_WARNING_OBJECT (encoder,
       "ENCODER SUBMIT: submit_format=%s -> buf_fmt=%d stride=%d planes=%d fd0=%d fd1=%d width=%d height=%d",
       gst_video_format_to_string (submit_format),
@@ -1900,10 +1950,47 @@ v10conv_pipeline_encode:
     return GST_FLOW_FLUSHING;
   }
 
+  /* DMA_BUF_IOCTL_SYNC — bracket the VPU encode with read-access fences.
+   * Without this, the vfm_cap exporter can recycle the underlying CMA pages
+   * (via vf_put → VIDIOC_QBUF) while the Wave521 VPU is still reading,
+   * causing a kernel crash.  The SYNC_START tells the exporter we are
+   * actively reading; SYNC_END (after encode) releases that claim. */
+  int sync_input_fd = encoder->fd[0];
+  struct dma_buf_sync dbs_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+  struct dma_buf_sync dbs_end   = { .flags = DMA_BUF_SYNC_END   | DMA_BUF_SYNC_READ };
+  if (sync_input_fd >= 0) {
+    int sr = ioctl(sync_input_fd, DMA_BUF_IOCTL_SYNC, &dbs_start);
+    if (sr < 0) {
+      GST_WARNING_OBJECT (encoder, "DMA_BUF_SYNC_START failed on fd %d: %s",
+          sync_input_fd, g_strerror (errno));
+    }
+  }
+
   gint64 t_enc_start = g_get_monotonic_time();
+  g_mutex_lock (&encoder->encoder_lock);
+  if (G_UNLIKELY (encoder->codec.handle == 0)) {
+    g_mutex_unlock (&encoder->encoder_lock);
+    if (sync_input_fd >= 0)
+      ioctl(sync_input_fd, DMA_BUF_IOCTL_SYNC, &dbs_end);
+    GST_WARNING_OBJECT (encoder, "encode_frame: codec handle destroyed while waiting for lock");
+    if (frame)
+      gst_video_codec_frame_unref (frame);
+    return GST_FLOW_FLUSHING;
+  }
   encoding_metadata_t meta =
       vl_multi_encoder_encode(encoder->codec.handle, frame_type,
                               encoder->codec.buf, &inbuf_info, &retbuf_info);
+  g_mutex_unlock (&encoder->encoder_lock);
+
+  /* Release DMA-buf read access — exporter may now recycle the buffer */
+  if (sync_input_fd >= 0) {
+    int er = ioctl(sync_input_fd, DMA_BUF_IOCTL_SYNC, &dbs_end);
+    if (er < 0) {
+      GST_WARNING_OBJECT (encoder, "DMA_BUF_SYNC_END failed on fd %d: %s",
+          sync_input_fd, g_strerror (errno));
+    }
+  }
+
   gint64 enc_us = g_get_monotonic_time() - t_enc_start;
   GST_WARNING_OBJECT(encoder, "[ENC-PROF] encoder: %" G_GINT64_FORMAT " us (%.2f ms)",
       enc_us, enc_us / 1000.0);
@@ -1953,7 +2040,7 @@ v10conv_pipeline_encode:
   //frame = gst_video_encoder_get_frame (GST_VIDEO_ENCODER (encoder), input_frame->system_frame_number);
   frame = gst_video_encoder_get_oldest_frame (GST_VIDEO_ENCODER (encoder));
   if (!frame) {
-    gst_video_codec_frame_unref (frame);
+    GST_ERROR_OBJECT (encoder, "No pending frame available after encoding");
     return GST_FLOW_ERROR;
   }
 
@@ -2000,6 +2087,7 @@ v10conv_pipeline_encode:
         frame_us, frame_us / 1000.0);
   }
 
+  dbg_frame_num++;
   return gst_video_encoder_finish_frame ( GST_VIDEO_ENCODER(encoder), frame);
 
 }

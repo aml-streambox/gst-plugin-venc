@@ -78,6 +78,7 @@ struct _GstAmlVEnc
     } output_buf[2];
     gint write_idx;       /* next buffer for GPU to write into (0 or 1) */
     gboolean pipeline_primed; /* TRUE after first frame's GPU work submitted */
+    gboolean vulkan_initialized; /* TRUE after yuv422_vulkan_init() succeeds */
   } v10conv;
 
   GstAllocator *dmabuf_alloc;
