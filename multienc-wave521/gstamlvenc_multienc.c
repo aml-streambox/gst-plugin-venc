@@ -932,6 +932,16 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encode_info.gop_pattern = encoder->gop_pattern;
   encode_info.rc_mode = encoder->rc_mode;
   encode_info.lossless_enable = encoder->lossless_enable;
+  /* FIX: For lossless encoding, increase bitstream buffer size if not explicitly set */
+  if (encoder->lossless_enable) {
+    /* Default buffer size may be too small for lossless (3-5x larger output) */
+    if (encoder->encoder_bufsize < 4096 * 1024) { // if less than 4MB
+      guint new_bufsize = 4096 * 1024; // 4MB minimum for lossless
+      GST_WARNING_OBJECT (encoder, "lossless mode: increasing encoder_bufsize from %dKB to %dKB",
+          encoder->encoder_bufsize / 1024, new_bufsize / 1024);
+      encoder->encoder_bufsize = new_bufsize;
+    }
+  }
   encode_info.bitstream_buf_sz_kb = encoder->encoder_bufsize / 1024;
   encoder->v10conv.enabled = (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_ENCODED);
 
