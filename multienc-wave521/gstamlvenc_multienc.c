@@ -117,6 +117,10 @@ gst_amlvenc_add_v_chroma_format (GstAmlVEnc *encoder, GstStructure * s)
 #define PROP_LOSSLESS_ENABLE_DEFAULT FALSE
 #define PROP_V10CONV_BACKEND_DEFAULT 0  /* 0=vulkan, 1=gles */
 
+#define PROP_QP_B_DEFAULT 0
+#define PROP_MIN_QP_B_DEFAULT 8
+#define PROP_MAX_QP_B_DEFAULT 51
+
 #define DRMBP_EXTRA_BUF_SIZE_FOR_DISPLAY 1
 #define DRMBP_LIMIT_MAX_BUFSIZE_TO_BUFSIZE 1
 
@@ -270,6 +274,9 @@ enum
   PROP_GOP_PATTERN,
   PROP_RC_MODE,
   PROP_LOSSLESS_ENABLE,
+  PROP_QP_B,
+  PROP_MIN_QP_B,
+  PROP_MAX_QP_B,
   PROD_ENABLE_DMALLOCATOR,
   PROP_V10CONV_BACKEND
 };
@@ -636,6 +643,21 @@ gst_amlvenc_class_init (GstAmlVEncClass * klass)
           PROP_LOSSLESS_ENABLE_DEFAULT,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_QP_B,
+      g_param_spec_int("qp-b", "qp-b", "Base QP for B-frames (0=auto)",
+          0, 51, PROP_QP_B_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_MIN_QP_B,
+      g_param_spec_int("min-qp-b", "min-qp-b", "Minimum QP for B-frames",
+          0, 51, PROP_MIN_QP_B_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_MAX_QP_B,
+      g_param_spec_int("max-qp-b", "max-qp-b", "Maximum QP for B-frames",
+          0, 51, PROP_MAX_QP_B_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   g_object_class_install_property (gobject_class, PROD_ENABLE_DMALLOCATOR,
       g_param_spec_boolean ("enable-dmallocator", "enable-dmallocator", "Enable/Disable dmallocator",
           FALSE,
@@ -688,6 +710,19 @@ gst_amlvenc_init (GstAmlVEnc * encoder)
   encoder->rc_mode = PROP_RC_MODE_DEFAULT;
   encoder->lossless_enable = PROP_LOSSLESS_ENABLE_DEFAULT;
   encoder->v10conv_backend = PROP_V10CONV_BACKEND_DEFAULT;
+  
+  /* B-frame QP properties */
+  encoder->qp_b = PROP_QP_B_DEFAULT;
+  encoder->min_qp_b = PROP_MIN_QP_B_DEFAULT;
+  encoder->max_qp_b = PROP_MAX_QP_B_DEFAULT;
+  
+  /* B-frame reordering state */
+  encoder->bframe_enabled = FALSE;
+  encoder->gop_size = 1;
+  encoder->frame_counter = 0;
+  encoder->reorder_count = 0;
+  encoder->frame_duration = GST_CLOCK_TIME_NONE;
+  memset(encoder->reorder_queue, 0, sizeof(encoder->reorder_queue));
 
   list_init(&encoder->roi.param_info);
   encoder->roi.srcid = 0;
@@ -1006,19 +1041,25 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   qp_tbl.qp_P_base = 30;
   qp_tbl.qp_P_min = 0;
   qp_tbl.qp_P_max = 51;
+  qp_tbl.qp_B_base = encoder->qp_b;
+  qp_tbl.qp_B_min = encoder->min_qp_b;
+  qp_tbl.qp_B_max = encoder->max_qp_b;
 
   encoder->codec.handle = vl_multi_encoder_init(encoder->codec.id, encode_info, &qp_tbl);
 
   if (encoder->codec.handle == 0) {
     GST_WARNING_OBJECT (encoder,
-        "vl_multi_encoder_init failed: codec=%d format=%s %dx%d fps=%d bitrate=%d depth=%d roi=%d",
+        "vl_multi_encoder_init failed: codec=%d format=%s %dx%d fps=%d bitrate=%d depth=%d roi=%d qp_b=%d min_qp_b=%d max_qp_b=%d",
         encoder->codec.id,
         gst_video_format_to_string (GST_VIDEO_INFO_FORMAT (info)),
         info->width, info->height,
         encoder->framerate,
         encoder->bitrate * 1000,
         encoder->internal_bit_depth,
-        encoder->roi.enabled ? 1 : 0);
+        encoder->roi.enabled ? 1 : 0,
+        encoder->qp_b,
+        encoder->min_qp_b,
+        encoder->max_qp_b);
     GST_ELEMENT_ERROR (encoder, STREAM, ENCODE,
         ("Can not initialize v encoder."), (NULL));
     return FALSE;
@@ -1027,6 +1068,46 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   if (!gst_amlvenc_set_roi (encoder)) {
     return FALSE;
   }
+  
+  /* Initialize B-frame reordering state based on GOP pattern */
+  encoder->frame_counter = 0;
+  encoder->reorder_count = 0;
+  encoder->bframe_enabled = FALSE;
+  encoder->gop_size = 1;
+  
+  /* Calculate frame duration for timestamp handling */
+  if (info->fps_n > 0 && info->fps_d > 0) {
+    encoder->frame_duration = gst_util_uint64_scale (GST_SECOND, info->fps_d, info->fps_n);
+  } else {
+    encoder->frame_duration = GST_SECOND / 30; /* default 30fps */
+  }
+  
+  /* Check if B-frames are enabled based on GOP pattern */
+  switch (encoder->gop_pattern) {
+    case 1: /* IBBBP */
+      encoder->bframe_enabled = TRUE;
+      encoder->gop_size = 4;
+      GST_INFO_OBJECT (encoder, "B-frames enabled: IBBBP pattern, GOP size %d", encoder->gop_size);
+      break;
+    case 2: /* IBPBP */
+      encoder->bframe_enabled = TRUE;
+      encoder->gop_size = 2;
+      GST_INFO_OBJECT (encoder, "B-frames enabled: IBPBP pattern, GOP size %d", encoder->gop_size);
+      break;
+    case 3: /* IBBB */
+      encoder->bframe_enabled = TRUE;
+      encoder->gop_size = 4;
+      GST_INFO_OBJECT (encoder, "B-frames enabled: IBBB pattern, GOP size %d", encoder->gop_size);
+      break;
+    default:
+      encoder->bframe_enabled = FALSE;
+      encoder->gop_size = 1;
+      GST_INFO_OBJECT (encoder, "B-frames disabled: GOP pattern %d", encoder->gop_pattern);
+      break;
+  }
+  
+  /* Clear reorder queue */
+  memset(encoder->reorder_queue, 0, sizeof(encoder->reorder_queue));
 
   if (GST_VIDEO_INFO_FORMAT(info) == GST_VIDEO_FORMAT_RGB ||
       GST_VIDEO_INFO_FORMAT(info) == GST_VIDEO_FORMAT_BGR) {
@@ -1269,6 +1350,75 @@ gst_amlvenc_set_src_caps (GstAmlVEnc * encoder, GstCaps * caps)
   return TRUE;
 }
 
+/* Calculate correct DTS for B-frame GOP structures
+ * Based on the backup code implementation
+ */
+static GstClockTime
+gst_amlvenc_calculate_dts (GstAmlVEnc * encoder, GstVideoCodecFrame * frame, 
+                           GstClockTime pts, gint frame_num)
+{
+  GstClockTime dts;
+  gint frame_in_gop;
+  
+  if (!encoder->bframe_enabled || encoder->frame_duration == GST_CLOCK_TIME_NONE) {
+    /* No B-frames: DTS = PTS */
+    return pts;
+  }
+  
+  frame_in_gop = frame_num % encoder->gop_size;
+  
+  /* For B-frame GOPs, calculate DTS based on decode order */
+  switch (encoder->gop_pattern) {
+    case 1: /* IBBBP: Decode order I,P,B,B,B (display order: I,B,B,B,P) */
+      if (frame_in_gop == 0) {
+        /* I frame: DTS = PTS */
+        dts = pts;
+      } else if (frame_in_gop == encoder->gop_size - 1) {
+        /* P frame: DTS comes right after I */
+        dts = pts - (encoder->gop_size - 1) * encoder->frame_duration;
+      } else {
+        /* B frames: DTS follows P frame */
+        dts = pts + (encoder->gop_size - 1 - frame_in_gop) * encoder->frame_duration;
+      }
+      break;
+      
+    case 2: /* IBPBP: Decode order I,P,B,P,B... (display order: I,B,P,B,P...) */
+      if (frame_in_gop == 0) {
+        /* I frame */
+        dts = pts;
+      } else if (frame_in_gop % 2 == 0) {
+        /* P frames at even positions (2, 4, 6...) */
+        dts = pts - encoder->frame_duration;
+      } else {
+        /* B frames at odd positions (1, 3, 5...) */
+        dts = pts + encoder->frame_duration;
+      }
+      break;
+      
+    case 3: /* IBBB: All B frames reference only I */
+      if (frame_in_gop == 0) {
+        /* I frame */
+        dts = pts;
+      } else {
+        /* B frames: decode after I but display at their position */
+        dts = pts - frame_in_gop * encoder->frame_duration + encoder->frame_duration;
+      }
+      break;
+      
+    default:
+      /* IPP or ALL_I: DTS = PTS */
+      dts = pts;
+      break;
+  }
+  
+  GST_LOG_OBJECT (encoder, "Calculated DTS for frame %d (GOP pos %d, pattern %d): "
+                  "PTS=%" GST_TIME_FORMAT " DTS=%" GST_TIME_FORMAT,
+                  frame_num, frame_in_gop, encoder->gop_pattern,
+                  GST_TIME_ARGS(pts), GST_TIME_ARGS(dts));
+  
+  return dts;
+}
+
 static void
 gst_amlvenc_set_latency (GstAmlVEnc * encoder)
 {
@@ -1276,7 +1426,22 @@ gst_amlvenc_set_latency (GstAmlVEnc * encoder)
   gint max_delayed_frames;
   GstClockTime latency;
 
-  max_delayed_frames = 0;
+  /* GOP patterns: 0=IPP, 1=IBBBP, 2=IBPBP, 3=IBBB, 4=ALL_I
+   * Calculate max_delayed_frames based on GOP pattern for B-frame support */
+  switch (encoder->gop_pattern) {
+    case 1: // IBBBP
+      max_delayed_frames = 4;  // 3 B-frames + 1 reorder delay
+      break;
+    case 2: // IBPBP
+      max_delayed_frames = 2;
+      break;
+    case 3: // IBBB
+      max_delayed_frames = 3;
+      break;
+    default: // IPP, ALL_I
+      max_delayed_frames = 0;
+      break;
+  }
 
   if (info->fps_n) {
     latency = gst_util_uint64_scale_ceil (GST_SECOND * info->fps_d,
@@ -1290,8 +1455,8 @@ gst_amlvenc_set_latency (GstAmlVEnc * encoder)
   }
 
   GST_INFO_OBJECT (encoder,
-      "Updating latency to %" GST_TIME_FORMAT " (%d frames)",
-      GST_TIME_ARGS (latency), max_delayed_frames);
+      "Updating latency to %" GST_TIME_FORMAT " (%d frames) for GOP pattern %d",
+      GST_TIME_ARGS (latency), max_delayed_frames, encoder->gop_pattern);
 
   gst_video_encoder_set_latency (GST_VIDEO_ENCODER (encoder), latency, latency);
 }
@@ -1466,7 +1631,8 @@ gst_amlvenc_finish (GstVideoEncoder * video_enc)
               1, GST_SECOND, info->fps_n / info->fps_d);
           frame->pts = GST_BUFFER_TIMESTAMP(frame->input_buffer);
         }
-        frame->dts = frame->pts;
+        /* Use DTS calculation for B-frame support in finish() path */
+        frame->dts = gst_amlvenc_calculate_dts (encoder, frame, frame->pts, encoder->dbg_frame_num);
 
         GST_WARNING_OBJECT(encoder, "Vulkan pipeline flush: finishing last frame pts=%" G_GINT64_FORMAT,
             (gint64)frame->pts);
@@ -2074,11 +2240,15 @@ v10conv_pipeline_encode:
       }
   }
 
-  frame->dts = frame->pts;
+  /* Use the new DTS calculation function for B-frame support
+   * We use the dbg_frame_num counter as the frame number for timestamp calculation
+   * This will correctly calculate DTS based on GOP pattern
+   */
+  frame->dts = gst_amlvenc_calculate_dts (encoder, frame, frame->pts, encoder->dbg_frame_num);
 
   GST_LOG_OBJECT (encoder,
-      "output: dts %" G_GINT64_FORMAT " pts %" G_GINT64_FORMAT,
-      (gint64) frame->dts, (gint64) frame->pts);
+      "output: dts %" G_GINT64_FORMAT " pts %" G_GINT64_FORMAT " (B-frame enabled: %d, GOP pattern: %d)",
+      (gint64) frame->dts, (gint64) frame->pts, encoder->bframe_enabled, encoder->gop_pattern);
 
   if (frame_type == FRAME_TYPE_IDR) {
     GST_DEBUG_OBJECT (encoder, "Output keyframe");
@@ -2161,6 +2331,15 @@ gst_amlvenc_get_property (GObject * object, guint prop_id,
       break;
     case PROP_LOSSLESS_ENABLE:
       g_value_set_boolean (value, encoder->lossless_enable);
+      break;
+    case PROP_QP_B:
+      g_value_set_int (value, encoder->qp_b);
+      break;
+    case PROP_MIN_QP_B:
+      g_value_set_int (value, encoder->min_qp_b);
+      break;
+    case PROP_MAX_QP_B:
+      g_value_set_int (value, encoder->max_qp_b);
       break;
     case PROP_V10CONV_BACKEND:
       g_value_set_int (value, encoder->v10conv_backend);
@@ -2257,6 +2436,18 @@ gst_amlvenc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_LOSSLESS_ENABLE:
       encoder->lossless_enable = g_value_get_boolean (value);
+      break;
+    case PROP_QP_B:
+      encoder->qp_b = g_value_get_int (value);
+      GST_LOG_OBJECT (encoder, "qp-b set to %d", encoder->qp_b);
+      break;
+    case PROP_MIN_QP_B:
+      encoder->min_qp_b = g_value_get_int (value);
+      GST_LOG_OBJECT (encoder, "min-qp-b set to %d", encoder->min_qp_b);
+      break;
+    case PROP_MAX_QP_B:
+      encoder->max_qp_b = g_value_get_int (value);
+      GST_LOG_OBJECT (encoder, "max-qp-b set to %d", encoder->max_qp_b);
       break;
     case PROP_V10CONV_BACKEND:
       encoder->v10conv_backend = g_value_get_int (value);
