@@ -190,9 +190,15 @@ gst_amlvenc_clear_v10conv_buffers (GstAmlVEnc * encoder)
   encoder->v10conv.pipeline_primed = FALSE;
 
   /* Clean up Vulkan GPU resources if initialized */
-  if (encoder->v10conv.vulkan_initialized) {
-    yuv422_vulkan_cleanup();
-    encoder->v10conv.vulkan_initialized = FALSE;
+  if (encoder->v10conv.vulkan_ctx) {
+    yuv422_vulkan_cleanup(encoder->v10conv.vulkan_ctx);
+    encoder->v10conv.vulkan_ctx = NULL;
+  }
+
+  /* Clean up GLES GPU resources if initialized */
+  if (encoder->v10conv.gles_ctx) {
+    yuv422_gpu_gles_cleanup(encoder->v10conv.gles_ctx);
+    encoder->v10conv.gles_ctx = NULL;
   }
 }
 
@@ -953,10 +959,13 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
         /* Update encoder framerate property to match source for logging/consistency */
         encoder->framerate = encode_info.frame_rate;
       }
-      if (yuv422_gpu_gles_init () != 0) {
-        GST_ELEMENT_ERROR (encoder, STREAM, ENCODE,
-            ("Can not initialize internal v10 converter."), (NULL));
-        return FALSE;
+      if (!encoder->v10conv.gles_ctx) {
+        encoder->v10conv.gles_ctx = yuv422_gpu_gles_init ();
+        if (!encoder->v10conv.gles_ctx) {
+          GST_ELEMENT_ERROR (encoder, STREAM, ENCODE,
+              ("Can not initialize internal v10 converter."), (NULL));
+          return FALSE;
+        }
       }
       if (!gst_amlvenc_prepare_v10conv_buffers (encoder, info)) {
         GST_ELEMENT_ERROR (encoder, STREAM, ENCODE,
@@ -1364,7 +1373,7 @@ gst_amlvenc_set_format (GstVideoEncoder * video_enc,
       info->width, info->height, encoder->roi.buffer_info.width, encoder->roi.buffer_info.height);
   if (encoder->roi.buffer_info.data == NULL) {
     encoder->roi.buffer_info.data =
-        g_new(guchar, encoder->roi.buffer_info.width * encoder->roi.buffer_info.width );
+        g_new(guchar, encoder->roi.buffer_info.width * encoder->roi.buffer_info.height );
     memset(encoder->roi.buffer_info.data,
            PROP_ROI_QUALITY_DEFAULT,
            encoder->roi.buffer_info.width * encoder->roi.buffer_info.height);
@@ -1595,7 +1604,6 @@ static GstFlowReturn
 gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
     GstVideoCodecFrame * frame)
 {
-  static unsigned long dbg_frame_num = 0;
   gint64 t_frame_start = g_get_monotonic_time();
   vl_frame_type_t frame_type = FRAME_TYPE_AUTO;
   GstVideoInfo *info = &encoder->input_state->info;
@@ -1662,13 +1670,12 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
          *
          * Throughput: max(GPU, encoder) = ~13ms/frame instead of sum = ~21.5ms.
          */
-        if (!encoder->v10conv.vulkan_initialized) {
-          if (yuv422_vulkan_init(info->width, info->height) == 0) {
-            encoder->v10conv.vulkan_initialized = TRUE;
+        if (!encoder->v10conv.vulkan_ctx) {
+          encoder->v10conv.vulkan_ctx = yuv422_vulkan_init(info->width, info->height);
+          if (encoder->v10conv.vulkan_ctx) {
             GST_WARNING_OBJECT(encoder, "Vulkan converter initialized successfully");
           } else {
-            GST_ERROR_OBJECT(encoder, "Vulkan init failed (%s)",
-                yuv422_vulkan_last_error());
+            GST_ERROR_OBJECT(encoder, "Vulkan init failed");
             return GST_FLOW_ERROR;
           }
         }
@@ -1680,10 +1687,10 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
           /* === FRAME 0: Prime the pipeline === */
           /* Synchronous GPU convert, then return early without encoding.
            * The next handle_frame call will encode this result. */
-          if (yuv422_vulkan_convert_dmabuf(in_fd, out_fd,
+          if (yuv422_vulkan_convert_dmabuf(encoder->v10conv.vulkan_ctx, in_fd, out_fd,
                   info->width, info->height) != 0) {
             GST_ERROR_OBJECT(encoder, "Vulkan conversion failed on first frame (%s)",
-                yuv422_vulkan_last_error());
+                yuv422_vulkan_last_error(encoder->v10conv.vulkan_ctx));
             return GST_FLOW_ERROR;
           }
           gint64 conv_us = g_get_monotonic_time() - t_conv_start;
@@ -1711,10 +1718,10 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
           int encode_fd = encoder->v10conv.output_buf[encode_buf].fd;
 
           /* 1. Submit GPU for frame N (non-blocking) */
-          if (yuv422_vulkan_convert_submit(in_fd, out_fd,
+          if (yuv422_vulkan_convert_submit(encoder->v10conv.vulkan_ctx, in_fd, out_fd,
                   info->width, info->height) != 0) {
             GST_ERROR_OBJECT(encoder, "Vulkan submit failed (%s)",
-                yuv422_vulkan_last_error());
+                yuv422_vulkan_last_error(encoder->v10conv.vulkan_ctx));
             return GST_FLOW_ERROR;
           }
 
@@ -1743,11 +1750,11 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
           GST_ERROR_OBJECT(encoder, "failed to dup output fd: %s", strerror(errno));
           return GST_FLOW_ERROR;
         }
-        if (yuv422_gpu_gles_convert_p010_dmabuf (in_fd,
+        if (yuv422_gpu_gles_convert_p010_dmabuf (encoder->v10conv.gles_ctx, in_fd,
                 encoder->v10conv.output_y.fd_dup,
                 info->width, info->height) != 0) {
           GST_ERROR_OBJECT (encoder, "GLES conversion failed (%s)",
-              yuv422_gpu_gles_last_error ());
+              yuv422_gpu_gles_last_error (encoder->v10conv.gles_ctx));
           close(encoder->v10conv.output_y.fd_dup);
           encoder->v10conv.output_y.fd_dup = -1;
           return GST_FLOW_ERROR;
@@ -1772,8 +1779,7 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
           submit_format, info->width, info->height, info->width * 2);
 
       {
-        static gboolean logged_p010_stats = FALSE;
-        if (!logged_p010_stats) {
+        if (!encoder->logged_p010_stats) {
           /* Sync dmabuf for CPU read — invalidate cache to see GPU writes */
           struct dma_buf_sync sync_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
           struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
@@ -1809,7 +1815,7 @@ gst_amlvenc_encode_frame (GstAmlVEnc * encoder,
                 "internal P010 sample stats: Y[min=%u max=%u] UV[min=%u max=%u]",
                 y_min, y_max, uv_min, uv_max);
             gst_memory_unmap (stats_mem, &p010_map);
-            logged_p010_stats = TRUE;
+            encoder->logged_p010_stats = TRUE;
           }
 
           if (sync_fd >= 0) {
@@ -2008,9 +2014,9 @@ v10conv_pipeline_encode:
   if (encoder->v10conv.enabled && encoder->v10conv_backend == 0 &&
       encoder->v10conv.pipeline_primed) {
     gint64 t_gpu_wait = g_get_monotonic_time();
-    if (yuv422_vulkan_convert_wait() != 0) {
+    if (yuv422_vulkan_convert_wait(encoder->v10conv.vulkan_ctx) != 0) {
       GST_ERROR_OBJECT(encoder, "Vulkan pipeline wait failed (%s)",
-          yuv422_vulkan_last_error());
+          yuv422_vulkan_last_error(encoder->v10conv.vulkan_ctx));
       /* Non-fatal — GPU result for NEXT frame is bad, but current encode succeeded */
     }
     gint64 gpu_wait_us = g_get_monotonic_time() - t_gpu_wait;
@@ -2087,7 +2093,7 @@ v10conv_pipeline_encode:
         frame_us, frame_us / 1000.0);
   }
 
-  dbg_frame_num++;
+  encoder->dbg_frame_num++;
   return gst_video_encoder_finish_frame ( GST_VIDEO_ENCODER(encoder), frame);
 
 }

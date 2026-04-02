@@ -7,10 +7,13 @@
 extern "C" {
 #endif
 
+typedef struct VulkanCtx VulkanCtx;
+
 /* Initialize Vulkan compute pipeline
- * Returns 0 on success, -1 on failure
+ * Returns context pointer on success, NULL on failure
+ * The caller owns the context and must call yuv422_vulkan_cleanup(ctx) to free it
  */
-int yuv422_vulkan_init(uint32_t width, uint32_t height);
+VulkanCtx *yuv422_vulkan_init(uint32_t width, uint32_t height);
 
 /* Convert 40-bit packed YUV422 to P010 using Vulkan compute
  * 
@@ -33,18 +36,18 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height);
  * 
  * Returns 0 on success, -1 on failure
  */
-int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t height);
+int yuv422_vulkan_convert_dmabuf(VulkanCtx *ctx, int in_fd, int out_fd, uint32_t width, uint32_t height);
 
 /* Non-blocking submit — dispatches GPU work, returns immediately.
- * Must call yuv422_vulkan_convert_wait() before the next submit.
+ * Must call yuv422_vulkan_convert_wait(ctx) before the next submit.
  * Returns 0 on success, -1 on failure.
  */
-int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t height);
+int yuv422_vulkan_convert_submit(VulkanCtx *ctx, int in_fd, int out_fd, uint32_t width, uint32_t height);
 
 /* Wait for previously submitted GPU work to complete.
  * Returns 0 on success (or if nothing pending), -1 on failure.
  */
-int yuv422_vulkan_convert_wait(void);
+int yuv422_vulkan_convert_wait(VulkanCtx *ctx);
 
 /* Release output resources after encoder is done
  * 
@@ -53,7 +56,7 @@ int yuv422_vulkan_convert_wait(void);
  * 
  * Returns 0 on success, -1 if no output to release
  */
-int yuv422_vulkan_release_output(void);
+int yuv422_vulkan_release_output(VulkanCtx *ctx);
 
 /* Convert using triple-buffered async pipeline
  * 
@@ -65,7 +68,7 @@ int yuv422_vulkan_release_output(void);
  * 
  * Returns 0 on success, -1 on failure
  */
-int yuv422_vulkan_convert_async(int in_fd, int out_fd, uint32_t width, uint32_t height,
+int yuv422_vulkan_convert_async(VulkanCtx *ctx, int in_fd, int out_fd, uint32_t width, uint32_t height,
                                  int slot, int *fence_fd);
 
 /* Wait for async conversion to complete
@@ -73,13 +76,13 @@ int yuv422_vulkan_convert_async(int in_fd, int out_fd, uint32_t width, uint32_t 
  * timeout_ms: maximum time to wait in milliseconds
  * Returns 0 if complete, -1 if timeout
  */
-int yuv422_vulkan_wait_async(int slot, int timeout_ms);
+int yuv422_vulkan_wait_async(VulkanCtx *ctx, int slot, int timeout_ms);
 
 /* Cleanup Vulkan resources */
-void yuv422_vulkan_cleanup(void);
+void yuv422_vulkan_cleanup(VulkanCtx *ctx);
 
 /* Get last error message */
-const char *yuv422_vulkan_last_error(void);
+const char *yuv422_vulkan_last_error(VulkanCtx *ctx);
 
 #ifdef __cplusplus
 }

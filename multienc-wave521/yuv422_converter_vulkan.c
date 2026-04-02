@@ -40,9 +40,19 @@
 
 #define VK_CHECK(result, msg) do { \
     if (result != VK_SUCCESS) { \
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "%s: %d", msg, result); \
-        fprintf(stderr, "[VULKAN-ERR] %s\n", ctx.last_error); \
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "%s: %d", msg, result); \
+        fprintf(stderr, "[VULKAN-ERR] %s\n", ctx->last_error); \
         return -1; \
+    } \
+} while(0)
+
+/* Variant for init function that must return NULL on failure */
+#define VK_CHECK_INIT(result, msg) do { \
+    if (result != VK_SUCCESS) { \
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "%s: %d", msg, result); \
+        fprintf(stderr, "[VULKAN-ERR] %s\n", ctx->last_error); \
+        free(ctx); \
+        return NULL; \
     } \
 } while(0)
 
@@ -70,7 +80,7 @@ typedef struct {
  * Vulkan Context Structure
  * ============================================================================= */
 
-typedef struct {
+struct VulkanCtx {
     VkInstance instance;
     VkPhysicalDevice physical_device;
     VkDevice device;
@@ -113,9 +123,7 @@ typedef struct {
     /* Pending submit state for split submit/wait API */
     int pending_in_fd;     /* input fd needing DMA_BUF_SYNC_END after wait, or -1 */
     int has_pending;       /* 1 if a submit is in-flight awaiting wait */
-} VulkanCtx;
-
-static VulkanCtx ctx = {0};
+};
 
 /* =============================================================================
  * Helper Functions
@@ -127,10 +135,10 @@ static double now_ms(void) {
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
 }
 
-static int find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags props) {
-    for (uint32_t i = 0; i < ctx.memory_props.memoryTypeCount; i++) {
+static int find_memory_type(VulkanCtx *ctx, uint32_t type_filter, VkMemoryPropertyFlags props) {
+    for (uint32_t i = 0; i < ctx->memory_props.memoryTypeCount; i++) {
         if ((type_filter & (1 << i)) && 
-            (ctx.memory_props.memoryTypes[i].propertyFlags & props) == props) {
+            (ctx->memory_props.memoryTypes[i].propertyFlags & props) == props) {
             return i;
         }
     }
@@ -140,16 +148,16 @@ static int find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags props) {
 /* Embed pre-compiled SPIR-V shader */
 #include "yuv422_to_p010_spv.h"
 
-static int load_shader(VkShaderModule *shader_module) {
+static int load_shader(VulkanCtx *ctx, VkShaderModule *shader_module) {
     VkShaderModuleCreateInfo create_info = {
         .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = sizeof(yuv422_to_p010_spv),
         .pCode = (const uint32_t *)yuv422_to_p010_spv,
     };
     
-    VkResult result = vkCreateShaderModule(ctx.device, &create_info, NULL, shader_module);
+    VkResult result = vkCreateShaderModule(ctx->device, &create_info, NULL, shader_module);
     if (result != VK_SUCCESS) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), 
+        snprintf(ctx->last_error, sizeof(ctx->last_error), 
                  "vkCreateShaderModule failed: %d", result);
         return -1;
     }
@@ -166,7 +174,7 @@ static int load_shader(VkShaderModule *shader_module) {
  * IMPORTANT: This function TAKES OWNERSHIP of 'fd' — Vulkan will close it.
  * Caller must pass a dup()'d fd if they need to keep the original.
  */
-static int import_dmabuf(int fd, VkDeviceSize size, VkBuffer *buffer, VkDeviceMemory *memory) {
+static int import_dmabuf(VulkanCtx *ctx, int fd, VkDeviceSize size, VkBuffer *buffer, VkDeviceMemory *memory) {
     VkExternalMemoryBufferCreateInfo ext_mem_info = {
         .sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO,
         .handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
@@ -180,15 +188,15 @@ static int import_dmabuf(int fd, VkDeviceSize size, VkBuffer *buffer, VkDeviceMe
         .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
     };
     
-    VkResult result = vkCreateBuffer(ctx.device, &buffer_info, NULL, buffer);
+    VkResult result = vkCreateBuffer(ctx->device, &buffer_info, NULL, buffer);
     if (result != VK_SUCCESS) {
         close(fd);
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "vkCreateBuffer failed: %d", result);
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "vkCreateBuffer failed: %d", result);
         return -1;
     }
     
     VkMemoryRequirements mem_reqs;
-    vkGetBufferMemoryRequirements(ctx.device, *buffer, &mem_reqs);
+    vkGetBufferMemoryRequirements(ctx->device, *buffer, &mem_reqs);
     
     VkImportMemoryFdInfoKHR import_info = {
         .sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR,
@@ -206,27 +214,27 @@ static int import_dmabuf(int fd, VkDeviceSize size, VkBuffer *buffer, VkDeviceMe
         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
         .pNext = &import_info,
         .allocationSize = alloc_size,
-        .memoryTypeIndex = find_memory_type(mem_reqs.memoryTypeBits, 0),
+        .memoryTypeIndex = find_memory_type(ctx, mem_reqs.memoryTypeBits, 0),
     };
     
     if (alloc_info.memoryTypeIndex == (uint32_t)-1) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "No suitable memory type");
-        vkDestroyBuffer(ctx.device, *buffer, NULL);
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "No suitable memory type");
+        vkDestroyBuffer(ctx->device, *buffer, NULL);
         return -1;
     }
     
-    result = vkAllocateMemory(ctx.device, &alloc_info, NULL, memory);
+    result = vkAllocateMemory(ctx->device, &alloc_info, NULL, memory);
     if (result != VK_SUCCESS) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "vkAllocateMemory failed: %d", result);
-        vkDestroyBuffer(ctx.device, *buffer, NULL);
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "vkAllocateMemory failed: %d", result);
+        vkDestroyBuffer(ctx->device, *buffer, NULL);
         return -1;
     }
     
-    result = vkBindBufferMemory(ctx.device, *buffer, *memory, 0);
+    result = vkBindBufferMemory(ctx->device, *buffer, *memory, 0);
     if (result != VK_SUCCESS) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "vkBindBufferMemory failed: %d", result);
-        vkFreeMemory(ctx.device, *memory, NULL);
-        vkDestroyBuffer(ctx.device, *buffer, NULL);
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "vkBindBufferMemory failed: %d", result);
+        vkFreeMemory(ctx->device, *memory, NULL);
+        vkDestroyBuffer(ctx->device, *buffer, NULL);
         return -1;
     }
     
@@ -238,21 +246,21 @@ static int import_dmabuf(int fd, VkDeviceSize size, VkBuffer *buffer, VkDeviceMe
  * ============================================================================= */
 
 /* Destroy a single cache entry's Vulkan resources */
-static void cache_entry_destroy(DmabufCacheEntry *entry) {
+static void cache_entry_destroy(VulkanCtx *ctx, DmabufCacheEntry *entry) {
     if (!entry->valid) return;
-    vkDestroyBuffer(ctx.device, entry->buffer, NULL);
-    vkFreeMemory(ctx.device, entry->memory, NULL);
+    vkDestroyBuffer(ctx->device, entry->buffer, NULL);
+    vkFreeMemory(ctx->device, entry->memory, NULL);
     entry->valid = 0;
     entry->fd = -1;
     entry->fd_dup = -1;
 }
 
 /* Look up or import an input dmabuf. Returns cache index, or -1 on failure. */
-static int input_cache_get(int fd, VkDeviceSize size) {
+static int input_cache_get(VulkanCtx *ctx, int fd, VkDeviceSize size) {
     /* Check if we already have this fd cached */
-    for (int i = 0; i < ctx.input_cache_count; i++) {
-        if (ctx.input_cache[i].valid && ctx.input_cache[i].fd == fd) {
-            ctx.input_cache[i].last_used = ctx.frame_count;
+    for (int i = 0; i < ctx->input_cache_count; i++) {
+        if (ctx->input_cache[i].valid && ctx->input_cache[i].fd == fd) {
+            ctx->input_cache[i].last_used = ctx->frame_count;
 #if VULKAN_DEBUG
             fprintf(stderr, "[VULKAN] Input cache HIT fd=%d slot=%d\n", fd, i);
 #endif
@@ -262,52 +270,52 @@ static int input_cache_get(int fd, VkDeviceSize size) {
     
     /* Cache miss — find a free slot or evict LRU */
     int slot = -1;
-    if (ctx.input_cache_count < DMABUF_CACHE_SIZE) {
-        slot = ctx.input_cache_count++;
+    if (ctx->input_cache_count < DMABUF_CACHE_SIZE) {
+        slot = ctx->input_cache_count++;
     } else {
         /* Evict least recently used */
         uint64_t oldest = UINT64_MAX;
         for (int i = 0; i < DMABUF_CACHE_SIZE; i++) {
-            if (ctx.input_cache[i].last_used < oldest) {
-                oldest = ctx.input_cache[i].last_used;
+            if (ctx->input_cache[i].last_used < oldest) {
+                oldest = ctx->input_cache[i].last_used;
                 slot = i;
             }
         }
         /* Must wait for GPU idle before destroying — caller ensures this */
-        cache_entry_destroy(&ctx.input_cache[slot]);
+        cache_entry_destroy(ctx, &ctx->input_cache[slot]);
     }
     
     /* Import the new fd */
     int fd_dup = dup(fd);
     if (fd_dup < 0) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "Failed to dup input fd %d: %s", fd, strerror(errno));
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "Failed to dup input fd %d: %s", fd, strerror(errno));
         return -1;
     }
     
     VkBuffer buffer;
     VkDeviceMemory memory;
-    if (import_dmabuf(fd_dup, size, &buffer, &memory) != 0) {
+    if (import_dmabuf(ctx, fd_dup, size, &buffer, &memory) != 0) {
         return -1;
     }
     
-    ctx.input_cache[slot].fd = fd;
-    ctx.input_cache[slot].fd_dup = fd_dup;
-    ctx.input_cache[slot].buffer = buffer;
-    ctx.input_cache[slot].memory = memory;
-    ctx.input_cache[slot].size = size;
-    ctx.input_cache[slot].valid = 1;
-    ctx.input_cache[slot].last_used = ctx.frame_count;
+    ctx->input_cache[slot].fd = fd;
+    ctx->input_cache[slot].fd_dup = fd_dup;
+    ctx->input_cache[slot].buffer = buffer;
+    ctx->input_cache[slot].memory = memory;
+    ctx->input_cache[slot].size = size;
+    ctx->input_cache[slot].valid = 1;
+    ctx->input_cache[slot].last_used = ctx->frame_count;
     
 #if VULKAN_DEBUG
-    fprintf(stderr, "[VULKAN] Input cache MISS fd=%d slot=%d (total cached=%d)\n", fd, slot, ctx.input_cache_count);
+    fprintf(stderr, "[VULKAN] Input cache MISS fd=%d slot=%d (total cached=%d)\n", fd, slot, ctx->input_cache_count);
 #endif
     
     return slot;
 }
 
 /* Look up or import the output dmabuf. Returns 0 on success. */
-static int output_cache_get(int fd, VkDeviceSize size) {
-    if (ctx.cached_output.valid && ctx.cached_output.fd == fd) {
+static int output_cache_get(VulkanCtx *ctx, int fd, VkDeviceSize size) {
+    if (ctx->cached_output.valid && ctx->cached_output.fd == fd) {
 #if VULKAN_DEBUG
         fprintf(stderr, "[VULKAN] Output cache HIT fd=%d\n", fd);
 #endif
@@ -315,28 +323,28 @@ static int output_cache_get(int fd, VkDeviceSize size) {
     }
     
     /* New fd or first frame — destroy old and import */
-    if (ctx.cached_output.valid) {
-        cache_entry_destroy(&ctx.cached_output);
+    if (ctx->cached_output.valid) {
+        cache_entry_destroy(ctx, &ctx->cached_output);
     }
     
     int fd_dup = dup(fd);
     if (fd_dup < 0) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "Failed to dup output fd %d: %s", fd, strerror(errno));
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "Failed to dup output fd %d: %s", fd, strerror(errno));
         return -1;
     }
     
     VkBuffer buffer;
     VkDeviceMemory memory;
-    if (import_dmabuf(fd_dup, size, &buffer, &memory) != 0) {
+    if (import_dmabuf(ctx, fd_dup, size, &buffer, &memory) != 0) {
         return -1;
     }
     
-    ctx.cached_output.fd = fd;
-    ctx.cached_output.fd_dup = fd_dup;
-    ctx.cached_output.buffer = buffer;
-    ctx.cached_output.memory = memory;
-    ctx.cached_output.size = size;
-    ctx.cached_output.valid = 1;
+    ctx->cached_output.fd = fd;
+    ctx->cached_output.fd_dup = fd_dup;
+    ctx->cached_output.buffer = buffer;
+    ctx->cached_output.memory = memory;
+    ctx->cached_output.size = size;
+    ctx->cached_output.valid = 1;
     
 #if VULKAN_DEBUG
     fprintf(stderr, "[VULKAN] Output cache MISS fd=%d (imported)\n", fd);
@@ -348,29 +356,32 @@ static int output_cache_get(int fd, VkDeviceSize size) {
  * Initialization
  * ============================================================================= */
 
-int yuv422_vulkan_init(uint32_t width, uint32_t height) {
-    if (ctx.initialized) {
-        return 0;
+VulkanCtx *yuv422_vulkan_init(uint32_t width, uint32_t height) {
+    VulkanCtx *ctx = calloc(1, sizeof(VulkanCtx));
+    if (!ctx) {
+        fprintf(stderr, "[VULKAN-ERR] Failed to allocate VulkanCtx\n");
+        return NULL;
     }
     
-    ctx.width = width;
-    ctx.height = height;
-    ctx.active_input_idx = -1;
-    ctx.input_cache_count = 0;
-    ctx.cached_output.valid = 0;
-    ctx.cached_output.fd = -1;
+    ctx->width = width;
+    ctx->height = height;
+    ctx->active_input_idx = -1;
+    ctx->input_cache_count = 0;
+    ctx->cached_output.valid = 0;
+    ctx->cached_output.fd = -1;
     
     for (int i = 0; i < DMABUF_CACHE_SIZE; i++) {
-        ctx.input_cache[i].valid = 0;
-        ctx.input_cache[i].fd = -1;
+        ctx->input_cache[i].valid = 0;
+        ctx->input_cache[i].fd = -1;
     }
     
     /* Check for Vulkan support */
     uint32_t instance_version = 0;
     VkResult result = vkEnumerateInstanceVersion(&instance_version);
     if (result != VK_SUCCESS) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "Vulkan not supported");
-        return -1;
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "Vulkan not supported");
+        free(ctx);
+        return NULL;
     }
     
     fprintf(stderr, "[VULKAN] Instance version: %d.%d.%d\n",
@@ -400,19 +411,21 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
         .ppEnabledExtensionNames = extensions,
     };
     
-    result = vkCreateInstance(&instance_info, NULL, &ctx.instance);
-    VK_CHECK(result, "vkCreateInstance");
+    result = vkCreateInstance(&instance_info, NULL, &ctx->instance);
+    VK_CHECK_INIT(result, "vkCreateInstance");
     
     /* Select physical device */
     uint32_t device_count = 0;
-    vkEnumeratePhysicalDevices(ctx.instance, &device_count, NULL);
+    vkEnumeratePhysicalDevices(ctx->instance, &device_count, NULL);
     if (device_count == 0) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "No Vulkan devices found");
-        return -1;
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "No Vulkan devices found");
+        vkDestroyInstance(ctx->instance, NULL);
+        free(ctx);
+        return NULL;
     }
     
     VkPhysicalDevice *devices = malloc(device_count * sizeof(VkPhysicalDevice));
-    vkEnumeratePhysicalDevices(ctx.instance, &device_count, devices);
+    vkEnumeratePhysicalDevices(ctx->instance, &device_count, devices);
     
     for (uint32_t i = 0; i < device_count; i++) {
         VkPhysicalDeviceProperties props;
@@ -425,31 +438,33 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
         
         for (uint32_t j = 0; j < queue_family_count; j++) {
             if (queue_families[j].queueFlags & VK_QUEUE_COMPUTE_BIT) {
-                ctx.physical_device = devices[i];
-                ctx.compute_queue_family = j;
+                ctx->physical_device = devices[i];
+                ctx->compute_queue_family = j;
                 fprintf(stderr, "[VULKAN] Selected device: %s\n", props.deviceName);
                 break;
             }
         }
         
         free(queue_families);
-        if (ctx.physical_device != VK_NULL_HANDLE) break;
+        if (ctx->physical_device != VK_NULL_HANDLE) break;
     }
     
     free(devices);
     
-    if (ctx.physical_device == VK_NULL_HANDLE) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "No device with compute support");
-        return -1;
+    if (ctx->physical_device == VK_NULL_HANDLE) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "No device with compute support");
+        vkDestroyInstance(ctx->instance, NULL);
+        free(ctx);
+        return NULL;
     }
     
-    vkGetPhysicalDeviceMemoryProperties(ctx.physical_device, &ctx.memory_props);
+    vkGetPhysicalDeviceMemoryProperties(ctx->physical_device, &ctx->memory_props);
     
     /* Create logical device */
     float queue_priority = 1.0f;
     VkDeviceQueueCreateInfo queue_info = {
         .sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
-        .queueFamilyIndex = ctx.compute_queue_family,
+        .queueFamilyIndex = ctx->compute_queue_family,
         .queueCount = 1,
         .pQueuePriorities = &queue_priority,
     };
@@ -470,32 +485,32 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
         .ppEnabledExtensionNames = device_extensions,
     };
     
-    result = vkCreateDevice(ctx.physical_device, &device_info, NULL, &ctx.device);
-    VK_CHECK(result, "vkCreateDevice");
+    result = vkCreateDevice(ctx->physical_device, &device_info, NULL, &ctx->device);
+    VK_CHECK_INIT(result, "vkCreateDevice");
     
-    vkGetDeviceQueue(ctx.device, ctx.compute_queue_family, 0, &ctx.compute_queue);
+    vkGetDeviceQueue(ctx->device, ctx->compute_queue_family, 0, &ctx->compute_queue);
     
     /* Create command pool */
     VkCommandPoolCreateInfo pool_info = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
-        .queueFamilyIndex = ctx.compute_queue_family,
+        .queueFamilyIndex = ctx->compute_queue_family,
         .flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT |
                  VK_COMMAND_POOL_CREATE_TRANSIENT_BIT,
     };
     
-    result = vkCreateCommandPool(ctx.device, &pool_info, NULL, &ctx.command_pool);
-    VK_CHECK(result, "vkCreateCommandPool");
+    result = vkCreateCommandPool(ctx->device, &pool_info, NULL, &ctx->command_pool);
+    VK_CHECK_INIT(result, "vkCreateCommandPool");
     
     /* Allocate command buffers */
     VkCommandBufferAllocateInfo cmd_alloc = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
-        .commandPool = ctx.command_pool,
+        .commandPool = ctx->command_pool,
         .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
         .commandBufferCount = MAX_FRAMES_IN_FLIGHT,
     };
     
-    result = vkAllocateCommandBuffers(ctx.device, &cmd_alloc, ctx.command_buffers);
-    VK_CHECK(result, "vkAllocateCommandBuffers");
+    result = vkAllocateCommandBuffers(ctx->device, &cmd_alloc, ctx->command_buffers);
+    VK_CHECK_INIT(result, "vkAllocateCommandBuffers");
     
     /* Create fences */
     VkFenceCreateInfo fence_info = {
@@ -504,9 +519,9 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
     };
     
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-        result = vkCreateFence(ctx.device, &fence_info, NULL, &ctx.fences[i]);
-        VK_CHECK(result, "vkCreateFence");
-        ctx.slot_busy[i] = 0;
+        result = vkCreateFence(ctx->device, &fence_info, NULL, &ctx->fences[i]);
+        VK_CHECK_INIT(result, "vkCreateFence");
+        ctx->slot_busy[i] = 0;
     }
     
     /* Create semaphores */
@@ -515,8 +530,8 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
     };
     
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-        result = vkCreateSemaphore(ctx.device, &semaphore_info, NULL, &ctx.semaphores[i]);
-        VK_CHECK(result, "vkCreateSemaphore");
+        result = vkCreateSemaphore(ctx->device, &semaphore_info, NULL, &ctx->semaphores[i]);
+        VK_CHECK_INIT(result, "vkCreateSemaphore");
     }
     
     /* Create descriptor pool */
@@ -531,8 +546,8 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
         .pPoolSizes = pool_sizes,
     };
     
-    result = vkCreateDescriptorPool(ctx.device, &desc_pool_info, NULL, &ctx.descriptor_pool);
-    VK_CHECK(result, "vkCreateDescriptorPool");
+    result = vkCreateDescriptorPool(ctx->device, &desc_pool_info, NULL, &ctx->descriptor_pool);
+    VK_CHECK_INIT(result, "vkCreateDescriptorPool");
     
     /* Create descriptor set layout */
     VkDescriptorSetLayoutBinding bindings[] = {
@@ -562,19 +577,19 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
         .pBindings = bindings,
     };
     
-    result = vkCreateDescriptorSetLayout(ctx.device, &layout_info, NULL, &ctx.descriptor_set_layout);
-    VK_CHECK(result, "vkCreateDescriptorSetLayout");
+    result = vkCreateDescriptorSetLayout(ctx->device, &layout_info, NULL, &ctx->descriptor_set_layout);
+    VK_CHECK_INIT(result, "vkCreateDescriptorSetLayout");
     
     /* Allocate descriptor sets */
     VkDescriptorSetAllocateInfo desc_alloc = {
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
-        .descriptorPool = ctx.descriptor_pool,
+        .descriptorPool = ctx->descriptor_pool,
         .descriptorSetCount = MAX_FRAMES_IN_FLIGHT,
-        .pSetLayouts = (VkDescriptorSetLayout[]){ctx.descriptor_set_layout, ctx.descriptor_set_layout, ctx.descriptor_set_layout},
+        .pSetLayouts = (VkDescriptorSetLayout[]){ctx->descriptor_set_layout, ctx->descriptor_set_layout, ctx->descriptor_set_layout},
     };
     
-    result = vkAllocateDescriptorSets(ctx.device, &desc_alloc, ctx.descriptor_sets);
-    VK_CHECK(result, "vkAllocateDescriptorSets");
+    result = vkAllocateDescriptorSets(ctx->device, &desc_alloc, ctx->descriptor_sets);
+    VK_CHECK_INIT(result, "vkAllocateDescriptorSets");
     
     /* Create pipeline layout — push constants now include pairs_per_row */
     VkPushConstantRange push_constant = {
@@ -586,18 +601,18 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
     VkPipelineLayoutCreateInfo pipeline_layout_info = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
         .setLayoutCount = 1,
-        .pSetLayouts = &ctx.descriptor_set_layout,
+        .pSetLayouts = &ctx->descriptor_set_layout,
         .pushConstantRangeCount = 1,
         .pPushConstantRanges = &push_constant,
     };
     
-    result = vkCreatePipelineLayout(ctx.device, &pipeline_layout_info, NULL, &ctx.pipeline_layout);
-    VK_CHECK(result, "vkCreatePipelineLayout");
+    result = vkCreatePipelineLayout(ctx->device, &pipeline_layout_info, NULL, &ctx->pipeline_layout);
+    VK_CHECK_INIT(result, "vkCreatePipelineLayout");
     
     /* Load shader */
-    result = load_shader(&ctx.shader_module);
-    if (result != 0) {
-        return -1;
+    if (load_shader(ctx, &ctx->shader_module) != 0) {
+        free(ctx);
+        return NULL;
     }
     
     /* Create compute pipeline */
@@ -606,37 +621,37 @@ int yuv422_vulkan_init(uint32_t width, uint32_t height) {
         .stage = {
             .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
             .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-            .module = ctx.shader_module,
+            .module = ctx->shader_module,
             .pName = "main",
         },
-        .layout = ctx.pipeline_layout,
+        .layout = ctx->pipeline_layout,
     };
     
-    result = vkCreateComputePipelines(ctx.device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &ctx.pipeline);
-    VK_CHECK(result, "vkCreateComputePipelines");
+    result = vkCreateComputePipelines(ctx->device, VK_NULL_HANDLE, 1, &pipeline_info, NULL, &ctx->pipeline);
+    VK_CHECK_INIT(result, "vkCreateComputePipelines");
     
-    ctx.initialized = 1;
-    ctx.frame_count = 0;
+    ctx->initialized = 1;
+    ctx->frame_count = 0;
     fprintf(stderr, "[VULKAN] Initialization complete\n");
     
-    return 0;
+    return ctx;
 }
 
 /* =============================================================================
  * Non-blocking Submit — dispatches GPU work, returns immediately
  * ============================================================================= */
 
-int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t height) {
-    if (!ctx.initialized) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "Vulkan not initialized");
+int yuv422_vulkan_convert_submit(VulkanCtx *ctx, int in_fd, int out_fd, uint32_t width, uint32_t height) {
+    if (!ctx || !ctx->initialized) {
+        if (ctx) snprintf(ctx->last_error, sizeof(ctx->last_error), "Vulkan not initialized");
         return -1;
     }
     
     VkResult result;
     
     /* Fence management */
-    if (ctx.frame_count == 0) {
-        vkResetFences(ctx.device, 1, &ctx.fences[0]);
+    if (ctx->frame_count == 0) {
+        vkResetFences(ctx->device, 1, &ctx->fences[0]);
     }
     
     /* Calculate buffer sizes */
@@ -658,7 +673,7 @@ int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t
     fprintf(stderr, "[VULKAN] Buffer sizes: input=%lu output=%lu (Y=%lu UV=%lu) width=%u height=%u frame=%lu\n",
             (unsigned long)input_size, (unsigned long)output_size,
             (unsigned long)y_plane_size, (unsigned long)uv_plane_size,
-            width, height, (unsigned long)ctx.frame_count);
+            width, height, (unsigned long)ctx->frame_count);
 #endif
     
     /* === Cached dmabuf imports + DMA-buf sync === */
@@ -669,29 +684,29 @@ int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t
      * physical pages), but we must tell the kernel to invalidate caches so the
      * GPU sees the capture device's latest writes.
      */
-    int in_idx = input_cache_get(in_fd, input_size);
+    int in_idx = input_cache_get(ctx, in_fd, input_size);
     if (in_idx < 0) {
         return -1;
     }
-    ctx.active_input_idx = in_idx;
+    ctx->active_input_idx = in_idx;
     
     /* DMA_BUF_SYNC_START(READ) — invalidate CPU/GPU caches for this dmabuf
      * so the compute shader reads the capture device's latest frame data */
     struct dma_buf_sync sync_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
     ioctl(in_fd, DMA_BUF_IOCTL_SYNC, &sync_start);
     
-    VkBuffer in_buffer = ctx.input_cache[in_idx].buffer;
+    VkBuffer in_buffer = ctx->input_cache[in_idx].buffer;
     
     /* Output: look up or import (same fd every frame — safe to cache) */
-    if (output_cache_get(out_fd, output_size) != 0) {
+    if (output_cache_get(ctx, out_fd, output_size) != 0) {
         return -1;
     }
-    VkBuffer out_buffer = ctx.cached_output.buffer;
+    VkBuffer out_buffer = ctx->cached_output.buffer;
     
     /* Record command buffer */
-    VkCommandBuffer cmd = ctx.command_buffers[0];
+    VkCommandBuffer cmd = ctx->command_buffers[0];
     
-    result = vkResetCommandPool(ctx.device, ctx.command_pool, 0);
+    result = vkResetCommandPool(ctx->device, ctx->command_pool, 0);
     VK_CHECK(result, "vkResetCommandPool");
     
     VkCommandBufferBeginInfo begin_info = {
@@ -712,7 +727,7 @@ int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t
     VkWriteDescriptorSet writes[] = {
         {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = ctx.descriptor_sets[0],
+            .dstSet = ctx->descriptor_sets[0],
             .dstBinding = 0,
             .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -720,7 +735,7 @@ int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t
         },
         {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = ctx.descriptor_sets[0],
+            .dstSet = ctx->descriptor_sets[0],
             .dstBinding = 1,
             .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -728,7 +743,7 @@ int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t
         },
         {
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-            .dstSet = ctx.descriptor_sets[0],
+            .dstSet = ctx->descriptor_sets[0],
             .dstBinding = 2,
             .descriptorCount = 1,
             .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
@@ -736,17 +751,17 @@ int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t
         },
     };
     
-    vkUpdateDescriptorSets(ctx.device, 3, writes, 0, NULL);
+    vkUpdateDescriptorSets(ctx->device, 3, writes, 0, NULL);
     
     /* Bind pipeline and descriptors */
-    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline);
-    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx.pipeline_layout,
-                            0, 1, &ctx.descriptor_sets[0], 0, NULL);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline);
+    vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, ctx->pipeline_layout,
+                            0, 1, &ctx->descriptor_sets[0], 0, NULL);
     
     /* Push constants: width, height, pairs_per_row */
     uint32_t pairs_per_row = width / 2;
     uint32_t push_data[] = {width, height, pairs_per_row};
-    vkCmdPushConstants(cmd, ctx.pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+    vkCmdPushConstants(cmd, ctx->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
                        0, sizeof(push_data), push_data);
     
     /* 2D dispatch: x = pairs per row, y = rows */
@@ -775,12 +790,12 @@ int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t
         .pCommandBuffers = &cmd,
     };
     
-    result = vkQueueSubmit(ctx.compute_queue, 1, &submit_info, ctx.fences[0]);
+    result = vkQueueSubmit(ctx->compute_queue, 1, &submit_info, ctx->fences[0]);
     VK_CHECK(result, "vkQueueSubmit");
     
     /* Track pending state for the wait call */
-    ctx.pending_in_fd = in_fd;
-    ctx.has_pending = 1;
+    ctx->pending_in_fd = in_fd;
+    ctx->has_pending = 1;
     
     return 0;
 }
@@ -789,37 +804,37 @@ int yuv422_vulkan_convert_submit(int in_fd, int out_fd, uint32_t width, uint32_t
  * Wait for previously submitted GPU work to complete
  * ============================================================================= */
 
-int yuv422_vulkan_convert_wait(void) {
-    if (!ctx.initialized) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "Vulkan not initialized");
+int yuv422_vulkan_convert_wait(VulkanCtx *ctx) {
+    if (!ctx || !ctx->initialized) {
+        if (ctx) snprintf(ctx->last_error, sizeof(ctx->last_error), "Vulkan not initialized");
         return -1;
     }
     
-    if (!ctx.has_pending) {
+    if (!ctx->has_pending) {
         /* Nothing to wait for */
         return 0;
     }
     
-    VkResult result = vkWaitForFences(ctx.device, 1, &ctx.fences[0], VK_TRUE, 5000000000ULL);
+    VkResult result = vkWaitForFences(ctx->device, 1, &ctx->fences[0], VK_TRUE, 5000000000ULL);
     
     /* DMA_BUF_SYNC_END(READ) — release our read access to the input dmabuf
      * so the capture device can write new frame data to it */
-    if (ctx.pending_in_fd >= 0) {
+    if (ctx->pending_in_fd >= 0) {
         struct dma_buf_sync sync_end = { .flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ };
-        ioctl(ctx.pending_in_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
+        ioctl(ctx->pending_in_fd, DMA_BUF_IOCTL_SYNC, &sync_end);
     }
     
-    ctx.has_pending = 0;
-    ctx.pending_in_fd = -1;
+    ctx->has_pending = 0;
+    ctx->pending_in_fd = -1;
     
     if (result != VK_SUCCESS) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "vkWaitForFences failed: %d (frame %lu)", result, (unsigned long)ctx.frame_count);
-        fprintf(stderr, "[VULKAN-ERR] %s\n", ctx.last_error);
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "vkWaitForFences failed: %d (frame %lu)", result, (unsigned long)ctx->frame_count);
+        fprintf(stderr, "[VULKAN-ERR] %s\n", ctx->last_error);
         return -1;
     }
     
-    vkResetFences(ctx.device, 1, &ctx.fences[0]);
-    ctx.frame_count++;
+    vkResetFences(ctx->device, 1, &ctx->fences[0]);
+    ctx->frame_count++;
     
     return 0;
 }
@@ -828,18 +843,18 @@ int yuv422_vulkan_convert_wait(void) {
  * Synchronous Conversion (Blocking) — convenience wrapper
  * ============================================================================= */
 
-int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t height) {
+int yuv422_vulkan_convert_dmabuf(VulkanCtx *ctx, int in_fd, int out_fd, uint32_t width, uint32_t height) {
     double t_start = now_ms();
     
-    int ret = yuv422_vulkan_convert_submit(in_fd, out_fd, width, height);
+    int ret = yuv422_vulkan_convert_submit(ctx, in_fd, out_fd, width, height);
     if (ret != 0) return ret;
     
-    ret = yuv422_vulkan_convert_wait();
+    ret = yuv422_vulkan_convert_wait(ctx);
     if (ret != 0) return ret;
     
 #if VULKAN_DEBUG
     double elapsed = now_ms() - t_start;
-    fprintf(stderr, "[VULKAN-PROF] Convert frame %lu: %.3f ms (SYNC)\n", (unsigned long)(ctx.frame_count - 1), elapsed);
+    fprintf(stderr, "[VULKAN-PROF] Convert frame %lu: %.3f ms (SYNC)\n", (unsigned long)(ctx->frame_count - 1), elapsed);
 #endif
     
     return 0;
@@ -851,8 +866,8 @@ int yuv422_vulkan_convert_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t
  * Only called at cleanup to actually destroy resources.
  * ============================================================================= */
 
-int yuv422_vulkan_release_output(void) {
-    if (!ctx.initialized) {
+int yuv422_vulkan_release_output(VulkanCtx *ctx) {
+    if (!ctx || !ctx->initialized) {
         return -1;
     }
     /* With cached imports, output stays alive — nothing to release per-frame */
@@ -863,38 +878,38 @@ int yuv422_vulkan_release_output(void) {
  * Asynchronous Conversion (Non-Blocking) — Stub
  * ============================================================================= */
 
-int yuv422_vulkan_convert_async(int in_fd, int out_fd, uint32_t width, uint32_t height,
+int yuv422_vulkan_convert_async(VulkanCtx *ctx, int in_fd, int out_fd, uint32_t width, uint32_t height,
                                  int slot, int *fence_fd) {
-    if (!ctx.initialized) {
+    if (!ctx || !ctx->initialized) {
         return -1;
     }
     
     if (slot < 0 || slot >= MAX_FRAMES_IN_FLIGHT) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "Invalid slot %d", slot);
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "Invalid slot %d", slot);
         return -1;
     }
     
-    if (ctx.slot_busy[slot]) {
-        snprintf(ctx.last_error, sizeof(ctx.last_error), "Slot %d is busy", slot);
+    if (ctx->slot_busy[slot]) {
+        snprintf(ctx->last_error, sizeof(ctx->last_error), "Slot %d is busy", slot);
         return -1;
     }
     
-    ctx.slot_busy[slot] = 1;
+    ctx->slot_busy[slot] = 1;
     
-    snprintf(ctx.last_error, sizeof(ctx.last_error), "Async conversion not yet implemented");
+    snprintf(ctx->last_error, sizeof(ctx->last_error), "Async conversion not yet implemented");
     return -1;
 }
 
-int yuv422_vulkan_wait_async(int slot, int timeout_ms) {
-    if (!ctx.initialized || slot < 0 || slot >= MAX_FRAMES_IN_FLIGHT) {
+int yuv422_vulkan_wait_async(VulkanCtx *ctx, int slot, int timeout_ms) {
+    if (!ctx || !ctx->initialized || slot < 0 || slot >= MAX_FRAMES_IN_FLIGHT) {
         return -1;
     }
     
-    if (!ctx.slot_busy[slot]) {
+    if (!ctx->slot_busy[slot]) {
         return 0;
     }
     
-    VkResult result = vkWaitForFences(ctx.device, 1, &ctx.fences[slot], VK_TRUE,
+    VkResult result = vkWaitForFences(ctx->device, 1, &ctx->fences[slot], VK_TRUE,
                                        timeout_ms * 1000000ULL);
     
     if (result == VK_TIMEOUT) {
@@ -902,7 +917,7 @@ int yuv422_vulkan_wait_async(int slot, int timeout_ms) {
     }
     
     if (result == VK_SUCCESS) {
-        ctx.slot_busy[slot] = 0;
+        ctx->slot_busy[slot] = 0;
         return 0;
     }
     
@@ -913,48 +928,50 @@ int yuv422_vulkan_wait_async(int slot, int timeout_ms) {
  * Cleanup
  * ============================================================================= */
 
-void yuv422_vulkan_cleanup(void) {
-    if (!ctx.initialized) {
+void yuv422_vulkan_cleanup(VulkanCtx *ctx) {
+    if (!ctx || !ctx->initialized) {
+        free(ctx);
         return;
     }
     
-    vkDeviceWaitIdle(ctx.device);
+    vkDeviceWaitIdle(ctx->device);
     
     /* Destroy cached imports */
-    for (int i = 0; i < ctx.input_cache_count; i++) {
-        cache_entry_destroy(&ctx.input_cache[i]);
+    for (int i = 0; i < ctx->input_cache_count; i++) {
+        cache_entry_destroy(ctx, &ctx->input_cache[i]);
     }
-    ctx.input_cache_count = 0;
+    ctx->input_cache_count = 0;
     
-    cache_entry_destroy(&ctx.cached_output);
+    cache_entry_destroy(ctx, &ctx->cached_output);
     
     /* Destroy Vulkan resources */
     for (int i = 0; i < MAX_FRAMES_IN_FLIGHT; i++) {
-        vkDestroyFence(ctx.device, ctx.fences[i], NULL);
-        vkDestroySemaphore(ctx.device, ctx.semaphores[i], NULL);
+        vkDestroyFence(ctx->device, ctx->fences[i], NULL);
+        vkDestroySemaphore(ctx->device, ctx->semaphores[i], NULL);
     }
     
-    if (ctx.pipeline != VK_NULL_HANDLE)
-        vkDestroyPipeline(ctx.device, ctx.pipeline, NULL);
-    if (ctx.pipeline_layout != VK_NULL_HANDLE)
-        vkDestroyPipelineLayout(ctx.device, ctx.pipeline_layout, NULL);
-    if (ctx.shader_module != VK_NULL_HANDLE)
-        vkDestroyShaderModule(ctx.device, ctx.shader_module, NULL);
-    if (ctx.descriptor_set_layout != VK_NULL_HANDLE)
-        vkDestroyDescriptorSetLayout(ctx.device, ctx.descriptor_set_layout, NULL);
-    if (ctx.descriptor_pool != VK_NULL_HANDLE)
-        vkDestroyDescriptorPool(ctx.device, ctx.descriptor_pool, NULL);
-    if (ctx.command_pool != VK_NULL_HANDLE)
-        vkDestroyCommandPool(ctx.device, ctx.command_pool, NULL);
-    if (ctx.device != VK_NULL_HANDLE)
-        vkDestroyDevice(ctx.device, NULL);
-    if (ctx.instance != VK_NULL_HANDLE)
-        vkDestroyInstance(ctx.instance, NULL);
+    if (ctx->pipeline != VK_NULL_HANDLE)
+        vkDestroyPipeline(ctx->device, ctx->pipeline, NULL);
+    if (ctx->pipeline_layout != VK_NULL_HANDLE)
+        vkDestroyPipelineLayout(ctx->device, ctx->pipeline_layout, NULL);
+    if (ctx->shader_module != VK_NULL_HANDLE)
+        vkDestroyShaderModule(ctx->device, ctx->shader_module, NULL);
+    if (ctx->descriptor_set_layout != VK_NULL_HANDLE)
+        vkDestroyDescriptorSetLayout(ctx->device, ctx->descriptor_set_layout, NULL);
+    if (ctx->descriptor_pool != VK_NULL_HANDLE)
+        vkDestroyDescriptorPool(ctx->device, ctx->descriptor_pool, NULL);
+    if (ctx->command_pool != VK_NULL_HANDLE)
+        vkDestroyCommandPool(ctx->device, ctx->command_pool, NULL);
+    if (ctx->device != VK_NULL_HANDLE)
+        vkDestroyDevice(ctx->device, NULL);
+    if (ctx->instance != VK_NULL_HANDLE)
+        vkDestroyInstance(ctx->instance, NULL);
     
-    memset(&ctx, 0, sizeof(ctx));
     fprintf(stderr, "[VULKAN] Cleanup complete\n");
+    free(ctx);
 }
 
-const char *yuv422_vulkan_last_error(void) {
-    return ctx.last_error;
+const char *yuv422_vulkan_last_error(VulkanCtx *ctx) {
+    if (!ctx) return "NULL context";
+    return ctx->last_error;
 }

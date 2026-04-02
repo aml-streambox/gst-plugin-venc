@@ -17,6 +17,10 @@
 #include "list.h"
 #include "vp_multi_codec_1_0.h"
 
+/* Forward declarations for per-instance GPU converter contexts */
+typedef struct VulkanCtx VulkanCtx;
+typedef struct GpuCtx GpuCtx;
+
 #ifdef HAVE_STDINT_H
 #include <stdint.h>
 #endif
@@ -78,7 +82,8 @@ struct _GstAmlVEnc
     } output_buf[2];
     gint write_idx;       /* next buffer for GPU to write into (0 or 1) */
     gboolean pipeline_primed; /* TRUE after first frame's GPU work submitted */
-    gboolean vulkan_initialized; /* TRUE after yuv422_vulkan_init() succeeds */
+    VulkanCtx *vulkan_ctx;  /* per-instance Vulkan converter (NULL = not initialized) */
+    GpuCtx *gles_ctx;      /* per-instance GLES converter (NULL = not initialized) */
   } v10conv;
 
   GstAllocator *dmabuf_alloc;
@@ -125,6 +130,10 @@ struct _GstAmlVEnc
 
   /* SIGINT-driven EOS: encoder self-injects EOS on Ctrl+C */
   guint sigint_source_id;
+
+  /* per-instance debug/profiling state (was static local) */
+  unsigned long dbg_frame_num;
+  gboolean logged_p010_stats;
 
 };
 

@@ -30,7 +30,7 @@ typedef EGLImageKHR (EGLAPIENTRYP PFNEGLCREATEIMAGEKHRPROC) (EGLDisplay, EGLCont
 typedef EGLBoolean (EGLAPIENTRYP PFNEGLDESTROYIMAGEKHRPROC) (EGLDisplay, EGLImageKHR);
 typedef void (GL_APIENTRYP PFNGLEGLIMAGETARGETTEXTURE2DOESPROC) (GLenum, GLeglImageOES);
 
-typedef struct {
+struct GpuCtx {
   struct wl_display *wl_display;
   struct wl_registry *wl_registry;
   struct wl_compositor *wl_compositor;
@@ -74,9 +74,15 @@ typedef struct {
 
   char last_error[256];
   int initialized;
-} GpuCtx;
 
-static GpuCtx g = {0};
+  /* Per-instance timing stats (moved from static locals) */
+  unsigned frame_counter;
+  double sum_upload;
+  double sum_y;
+  double sum_uv;
+  double sum_wait;
+  double sum_total;
+};
 
 /*
  * Repack P010 to Wave521 MSB format:
@@ -110,10 +116,10 @@ static double now_ms(void) {
   return (double)ts.tv_sec * 1000.0 + (double)ts.tv_nsec / 1000000.0;
 }
 
-static int check_gl_error(const char *where) {
+static int check_gl_error(GpuCtx *g, const char *where) {
   GLenum err = glGetError();
   if (err != GL_NO_ERROR) {
-    snprintf(g.last_error, sizeof(g.last_error), "%s: GL error 0x%x", where, err);
+    snprintf(g->last_error, sizeof(g->last_error), "%s: GL error 0x%x", where, err);
     return -1;
   }
   return 0;
@@ -255,7 +261,7 @@ static void registry_remove(void *data, struct wl_registry *reg, uint32_t id) {
 
 static const struct wl_registry_listener reg_listener = { registry_global, registry_remove };
 
-static GLuint compile_cs(const char *src) {
+static GLuint compile_cs(GpuCtx *g, const char *src) {
   GLuint s = glCreateShader(GL_COMPUTE_SHADER);
   glShaderSource(s, 1, &src, NULL);
   glCompileShader(s);
@@ -264,14 +270,14 @@ static GLuint compile_cs(const char *src) {
   if (!ok) {
     char log[512] = {0};
     glGetShaderInfoLog(s, sizeof(log), NULL, log);
-    snprintf(g.last_error, sizeof(g.last_error), "compute shader compile failed: %s", log);
+    snprintf(g->last_error, sizeof(g->last_error), "compute shader compile failed: %s", log);
     glDeleteShader(s);
     return 0;
   }
   return s;
 }
 
-static GLuint link_program(GLuint shader) {
+static GLuint link_program(GpuCtx *g, GLuint shader) {
   GLuint p = glCreateProgram();
   glAttachShader(p, shader);
   glLinkProgram(p);
@@ -281,135 +287,154 @@ static GLuint link_program(GLuint shader) {
   if (!ok) {
     char log[512] = {0};
     glGetProgramInfoLog(p, sizeof(log), NULL, log);
-    snprintf(g.last_error, sizeof(g.last_error), "program link failed: %s", log);
+    snprintf(g->last_error, sizeof(g->last_error), "program link failed: %s", log);
     glDeleteProgram(p);
     return 0;
   }
   return p;
 }
 
-int yuv422_gpu_gles_init(void) {
-  if (g.initialized)
-    return 0;
+GpuCtx *yuv422_gpu_gles_init(void) {
+  GpuCtx *g = calloc(1, sizeof(GpuCtx));
+  if (!g) {
+    fprintf(stderr, "[GLES-ERR] Failed to allocate GpuCtx\n");
+    return NULL;
+  }
 
   if (!getenv("WAYLAND_DISPLAY") || !*getenv("WAYLAND_DISPLAY"))
     setenv("WAYLAND_DISPLAY", "wayland-0", 1);
 
-  g.wl_display = wl_display_connect(NULL);
-  if (!g.wl_display) {
-    snprintf(g.last_error, sizeof(g.last_error), "wl_display_connect failed");
-    return -1;
+  g->wl_display = wl_display_connect(NULL);
+  if (!g->wl_display) {
+    snprintf(g->last_error, sizeof(g->last_error), "wl_display_connect failed");
+    free(g);
+    return NULL;
   }
 
-  g.wl_registry = wl_display_get_registry(g.wl_display);
-  wl_registry_add_listener(g.wl_registry, &reg_listener, &g);
-  wl_display_roundtrip(g.wl_display);
-  if (!g.wl_compositor) {
-    snprintf(g.last_error, sizeof(g.last_error), "no wayland compositor");
-    return -1;
+  g->wl_registry = wl_display_get_registry(g->wl_display);
+  wl_registry_add_listener(g->wl_registry, &reg_listener, g);
+  wl_display_roundtrip(g->wl_display);
+  if (!g->wl_compositor) {
+    snprintf(g->last_error, sizeof(g->last_error), "no wayland compositor");
+    wl_registry_destroy(g->wl_registry);
+    wl_display_disconnect(g->wl_display);
+    free(g);
+    return NULL;
   }
 
-  g.egl_display = eglGetDisplay((EGLNativeDisplayType)g.wl_display);
-  if (g.egl_display == EGL_NO_DISPLAY) {
-    snprintf(g.last_error, sizeof(g.last_error), "eglGetDisplay failed");
-    return -1;
+  g->egl_display = eglGetDisplay((EGLNativeDisplayType)g->wl_display);
+  if (g->egl_display == EGL_NO_DISPLAY) {
+    snprintf(g->last_error, sizeof(g->last_error), "eglGetDisplay failed");
+    free(g);
+    return NULL;
   }
 
   EGLint maj = 0, min = 0;
-  if (!eglInitialize(g.egl_display, &maj, &min)) {
-    snprintf(g.last_error, sizeof(g.last_error), "eglInitialize failed");
-    return -1;
+  if (!eglInitialize(g->egl_display, &maj, &min)) {
+    snprintf(g->last_error, sizeof(g->last_error), "eglInitialize failed");
+    free(g);
+    return NULL;
   }
 
   if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-    snprintf(g.last_error, sizeof(g.last_error), "eglBindAPI failed");
-    return -1;
+    snprintf(g->last_error, sizeof(g->last_error), "eglBindAPI failed");
+    free(g);
+    return NULL;
   }
 
   EGLint ncfg = 0;
   EGLConfig cfgs[64];
-  eglGetConfigs(g.egl_display, cfgs, 64, &ncfg);
+  eglGetConfigs(g->egl_display, cfgs, 64, &ncfg);
   for (EGLint i = 0; i < ncfg; i++) {
     EGLint st = 0, rt = 0;
-    eglGetConfigAttrib(g.egl_display, cfgs[i], EGL_SURFACE_TYPE, &st);
-    eglGetConfigAttrib(g.egl_display, cfgs[i], EGL_RENDERABLE_TYPE, &rt);
+    eglGetConfigAttrib(g->egl_display, cfgs[i], EGL_SURFACE_TYPE, &st);
+    eglGetConfigAttrib(g->egl_display, cfgs[i], EGL_RENDERABLE_TYPE, &rt);
     if ((st & EGL_WINDOW_BIT) && (rt & EGL_OPENGL_ES3_BIT)) {
-      g.egl_config = cfgs[i];
+      g->egl_config = cfgs[i];
       break;
     }
   }
 
   EGLint ctx_attr[] = { EGL_CONTEXT_CLIENT_VERSION, 3, EGL_NONE };
-  g.egl_context = eglCreateContext(g.egl_display, g.egl_config, EGL_NO_CONTEXT, ctx_attr);
-  if (g.egl_context == EGL_NO_CONTEXT) {
-    snprintf(g.last_error, sizeof(g.last_error), "eglCreateContext failed");
-    return -1;
+  g->egl_context = eglCreateContext(g->egl_display, g->egl_config, EGL_NO_CONTEXT, ctx_attr);
+  if (g->egl_context == EGL_NO_CONTEXT) {
+    snprintf(g->last_error, sizeof(g->last_error), "eglCreateContext failed");
+    free(g);
+    return NULL;
   }
 
-  g.wl_surface = wl_compositor_create_surface(g.wl_compositor);
-  g.wl_egl_window = wl_egl_window_create(g.wl_surface, 1, 1);
-  g.egl_surface = eglCreateWindowSurface(g.egl_display, g.egl_config, (EGLNativeWindowType)g.wl_egl_window, NULL);
-  if (g.egl_surface == EGL_NO_SURFACE) {
-    snprintf(g.last_error, sizeof(g.last_error), "eglCreateWindowSurface failed");
-    return -1;
+  g->wl_surface = wl_compositor_create_surface(g->wl_compositor);
+  g->wl_egl_window = wl_egl_window_create(g->wl_surface, 1, 1);
+  g->egl_surface = eglCreateWindowSurface(g->egl_display, g->egl_config, (EGLNativeWindowType)g->wl_egl_window, NULL);
+  if (g->egl_surface == EGL_NO_SURFACE) {
+    snprintf(g->last_error, sizeof(g->last_error), "eglCreateWindowSurface failed");
+    free(g);
+    return NULL;
   }
 
-  if (!eglMakeCurrent(g.egl_display, g.egl_surface, g.egl_surface, g.egl_context)) {
-    snprintf(g.last_error, sizeof(g.last_error), "eglMakeCurrent failed");
-    return -1;
+  if (!eglMakeCurrent(g->egl_display, g->egl_surface, g->egl_surface, g->egl_context)) {
+    snprintf(g->last_error, sizeof(g->last_error), "eglMakeCurrent failed");
+    free(g);
+    return NULL;
   }
 
-  g.program_y = link_program(compile_cs(shader_y));
-  if (!g.program_y)
-    return -1;
-  g.program_uv = link_program(compile_cs(shader_uv));
-  if (!g.program_uv)
-    return -1;
-  g.program_pack = link_program(compile_cs(shader_pack));
-  if (!g.program_pack)
-    return -1;
-  g.loc_pack_tex = glGetUniformLocation(g.program_pack, "in_tex");
+  g->program_y = link_program(g, compile_cs(g, shader_y));
+  if (!g->program_y) {
+    free(g);
+    return NULL;
+  }
+  g->program_uv = link_program(g, compile_cs(g, shader_uv));
+  if (!g->program_uv) {
+    free(g);
+    return NULL;
+  }
+  g->program_pack = link_program(g, compile_cs(g, shader_pack));
+  if (!g->program_pack) {
+    free(g);
+    return NULL;
+  }
+  g->loc_pack_tex = glGetUniformLocation(g->program_pack, "in_tex");
 
-  g.loc_y_chunks = glGetUniformLocation(g.program_y, "u_chunks_per_row");
-  g.loc_y_pairs = glGetUniformLocation(g.program_y, "u_pairs_per_row");
-  g.loc_y_h = glGetUniformLocation(g.program_y, "u_h");
-  g.loc_uv_chunks = glGetUniformLocation(g.program_uv, "u_chunks_per_row");
-  g.loc_uv_pairs = glGetUniformLocation(g.program_uv, "u_pairs_per_row");
-  g.loc_uv_half_h = glGetUniformLocation(g.program_uv, "u_half_h");
+  g->loc_y_chunks = glGetUniformLocation(g->program_y, "u_chunks_per_row");
+  g->loc_y_pairs = glGetUniformLocation(g->program_y, "u_pairs_per_row");
+  g->loc_y_h = glGetUniformLocation(g->program_y, "u_h");
+  g->loc_uv_chunks = glGetUniformLocation(g->program_uv, "u_chunks_per_row");
+  g->loc_uv_pairs = glGetUniformLocation(g->program_uv, "u_pairs_per_row");
+  g->loc_uv_half_h = glGetUniformLocation(g->program_uv, "u_half_h");
 
-  glGenBuffers(1, &g.ssbo_in);
-  glGenBuffers(1, &g.ssbo_y);
-  glGenBuffers(1, &g.ssbo_uv);
-  glGenTextures(1, &g.tex_in);
+  glGenBuffers(1, &g->ssbo_in);
+  glGenBuffers(1, &g->ssbo_y);
+  glGenBuffers(1, &g->ssbo_uv);
+  glGenTextures(1, &g->tex_in);
 
   const char *exts = (const char *)glGetString(GL_EXTENSIONS);
-  g.has_buffer_storage = (exts && strstr(exts, "GL_EXT_buffer_storage"));
-  if (g.has_buffer_storage) {
-    g.glBufferStorageEXT = (PFNGLBUFFERSTORAGEEXTPROC)eglGetProcAddress("glBufferStorageEXT");
-    if (!g.glBufferStorageEXT)
-      g.has_buffer_storage = 0;
+  g->has_buffer_storage = (exts && strstr(exts, "GL_EXT_buffer_storage"));
+  if (g->has_buffer_storage) {
+    g->glBufferStorageEXT = (PFNGLBUFFERSTORAGEEXTPROC)eglGetProcAddress("glBufferStorageEXT");
+    if (!g->glBufferStorageEXT)
+      g->has_buffer_storage = 0;
   }
 
-  g.eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
-  g.eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
-  g.glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+  g->eglCreateImageKHR = (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+  g->eglDestroyImageKHR = (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+  g->glEGLImageTargetTexture2DOES = (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
 
   /* Release current context from init thread.
    * Streaming thread will bind it in convert(). */
-  eglMakeCurrent(g.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+  eglMakeCurrent(g->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 
-  g.initialized = 1;
-  return 0;
+  g->initialized = 1;
+  return g;
 }
 
-int yuv422_gpu_gles_convert_p010(const ConversionParams *params) {
-  if (!g.initialized) {
-    snprintf(g.last_error, sizeof(g.last_error), "gpu not initialized");
+int yuv422_gpu_gles_convert_p010(GpuCtx *g, const ConversionParams *params) {
+  if (!g || !g->initialized) {
+    if (g) snprintf(g->last_error, sizeof(g->last_error), "gpu not initialized");
     return -1;
   }
 
   if (!params || !params->input_data) {
-    snprintf(g.last_error, sizeof(g.last_error), "invalid params");
+    snprintf(g->last_error, sizeof(g->last_error), "invalid params");
     return -1;
   }
 
@@ -417,13 +442,13 @@ int yuv422_gpu_gles_convert_p010(const ConversionParams *params) {
   double t0 = now_ms();
 
   pthread_t self_tid = pthread_self();
-  if (!g.context_bound || !pthread_equal(g.owner_thread, self_tid)) {
-    if (!eglMakeCurrent(g.egl_display, g.egl_surface, g.egl_surface, g.egl_context)) {
-      snprintf(g.last_error, sizeof(g.last_error), "eglMakeCurrent failed in convert");
+  if (!g->context_bound || !pthread_equal(g->owner_thread, self_tid)) {
+    if (!eglMakeCurrent(g->egl_display, g->egl_surface, g->egl_surface, g->egl_context)) {
+      snprintf(g->last_error, sizeof(g->last_error), "eglMakeCurrent failed in convert");
       return -1;
     }
-    g.context_bound = 1;
-    g.owner_thread = self_tid;
+    g->context_bound = 1;
+    g->owner_thread = self_tid;
   }
 
   const uint32_t w = params->width;
@@ -432,7 +457,7 @@ int yuv422_gpu_gles_convert_p010(const ConversionParams *params) {
   const uint32_t half_h = h / 2;
 
   if (w != 3840 || h != 2160) {
-    snprintf(g.last_error, sizeof(g.last_error), "fixed-kernel requires 3840x2160");
+    snprintf(g->last_error, sizeof(g->last_error), "fixed-kernel requires 3840x2160");
     return -1;
   }
 
@@ -440,117 +465,117 @@ int yuv422_gpu_gles_convert_p010(const ConversionParams *params) {
   const uint32_t y_bytes = w * h * 2;
   const uint32_t uv_bytes = pairs * half_h * 4;
 
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_in);
-  if (g.alloc_in_bytes < in_bytes) {
-    if (g.has_buffer_storage && g.glBufferStorageEXT) {
-      if (g.mapped_in) {
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->ssbo_in);
+  if (g->alloc_in_bytes < in_bytes) {
+    if (g->has_buffer_storage && g->glBufferStorageEXT) {
+      if (g->mapped_in) {
         glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-        g.mapped_in = NULL;
+        g->mapped_in = NULL;
       }
-      g.glBufferStorageEXT(GL_SHADER_STORAGE_BUFFER, in_bytes, NULL,
+      g->glBufferStorageEXT(GL_SHADER_STORAGE_BUFFER, in_bytes, NULL,
           GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT | GL_DYNAMIC_STORAGE_BIT_EXT);
-      g.mapped_in = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, in_bytes,
+      g->mapped_in = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, in_bytes,
           GL_MAP_WRITE_BIT | GL_MAP_PERSISTENT_BIT_EXT | GL_MAP_COHERENT_BIT_EXT);
-      if (!g.mapped_in) {
-        g.has_buffer_storage = 0;
+      if (!g->mapped_in) {
+        g->has_buffer_storage = 0;
         glBufferData(GL_SHADER_STORAGE_BUFFER, in_bytes, NULL, GL_DYNAMIC_DRAW);
       }
     } else {
       glBufferData(GL_SHADER_STORAGE_BUFFER, in_bytes, NULL, GL_DYNAMIC_DRAW);
     }
-    g.alloc_in_bytes = in_bytes;
+    g->alloc_in_bytes = in_bytes;
   }
-  if (g.has_buffer_storage && g.mapped_in) {
-    memcpy(g.mapped_in, params->input_data, in_bytes);
+  if (g->has_buffer_storage && g->mapped_in) {
+    memcpy(g->mapped_in, params->input_data, in_bytes);
   } else {
     glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, in_bytes, params->input_data);
   }
-  if (check_gl_error("upload input")) return -1;
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g.ssbo_in);
+  if (check_gl_error(g, "upload input")) return -1;
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g->ssbo_in);
   double t1 = now_ms();
 
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_y);
-  if (g.alloc_y_bytes < y_bytes) {
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->ssbo_y);
+  if (g->alloc_y_bytes < y_bytes) {
     glBufferData(GL_SHADER_STORAGE_BUFFER, y_bytes, NULL, GL_DYNAMIC_DRAW);
-    g.alloc_y_bytes = y_bytes;
+    g->alloc_y_bytes = y_bytes;
   }
-  if (check_gl_error("alloc y")) return -1;
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g.ssbo_y);
+  if (check_gl_error(g, "alloc y")) return -1;
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g->ssbo_y);
 
-  glUseProgram(g.program_y);
+  glUseProgram(g->program_y);
   glDispatchCompute(60, 2160, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-  if (check_gl_error("dispatch y")) return -1;
+  if (check_gl_error(g, "dispatch y")) return -1;
   double t2 = now_ms();
 
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_uv);
-  if (g.alloc_uv_bytes < uv_bytes) {
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->ssbo_uv);
+  if (g->alloc_uv_bytes < uv_bytes) {
     glBufferData(GL_SHADER_STORAGE_BUFFER, uv_bytes, NULL, GL_DYNAMIC_DRAW);
-    g.alloc_uv_bytes = uv_bytes;
+    g->alloc_uv_bytes = uv_bytes;
   }
-  if (check_gl_error("alloc uv")) return -1;
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g.ssbo_uv);
+  if (check_gl_error(g, "alloc uv")) return -1;
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g->ssbo_uv);
 
-  glUseProgram(g.program_uv);
+  glUseProgram(g->program_uv);
   glDispatchCompute(60, 1080, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
-  if (check_gl_error("dispatch uv")) return -1;
+  if (check_gl_error(g, "dispatch uv")) return -1;
   double t3 = now_ms();
 
   GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
   glFlush();
   glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 5000000000ULL);
   glDeleteSync(fence);
-  if (check_gl_error("wait fence")) return -1;
+  if (check_gl_error(g, "wait fence")) return -1;
   double t4 = now_ms();
 
-  static unsigned frame_counter = 0;
-  static double sum_upload = 0.0, sum_y = 0.0, sum_uv = 0.0, sum_wait = 0.0, sum_total = 0.0;
-  frame_counter++;
-  sum_upload += (t1 - t0);
-  sum_y += (t2 - t1);
-  sum_uv += (t3 - t2);
-  sum_wait += (t4 - t3);
-  sum_total += (t4 - t0);
+  /* Per-instance timing stats (no longer static globals) */
+  g->frame_counter++;
+  g->sum_upload += (t1 - t0);
+  g->sum_y += (t2 - t1);
+  g->sum_uv += (t3 - t2);
+  g->sum_wait += (t4 - t3);
+  g->sum_total += (t4 - t0);
 
-  if ((frame_counter % 30u) == 0u) {
+  if ((g->frame_counter % 30u) == 0u) {
     fprintf(stderr,
         "[v10conv-gpu] avg30 compute-only stages: upload=%.3fms y=%.3fms uv=%.3fms wait=%.3fms total=%.3fms\n",
-        sum_upload / 30.0, sum_y / 30.0, sum_uv / 30.0, sum_wait / 30.0, sum_total / 30.0);
-    sum_upload = sum_y = sum_uv = sum_wait = sum_total = 0.0;
+        g->sum_upload / 30.0, g->sum_y / 30.0, g->sum_uv / 30.0, g->sum_wait / 30.0, g->sum_total / 30.0);
+    g->sum_upload = g->sum_y = g->sum_uv = g->sum_wait = g->sum_total = 0.0;
   }
 
   if (compute_only) {
     return 0;
   }
 
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_y);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->ssbo_y);
   void *ym = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, y_bytes, GL_MAP_READ_BIT);
   if (!ym) {
-    snprintf(g.last_error, sizeof(g.last_error), "map Y buffer failed");
+    snprintf(g->last_error, sizeof(g->last_error), "map Y buffer failed");
     return -1;
   }
   memcpy(params->output_y, ym, y_bytes);
   glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_uv);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->ssbo_uv);
   void *uvm = glMapBufferRange(GL_SHADER_STORAGE_BUFFER, 0, uv_bytes, GL_MAP_READ_BIT);
   if (!uvm) {
-    snprintf(g.last_error, sizeof(g.last_error), "map UV buffer failed");
+    snprintf(g->last_error, sizeof(g->last_error), "map UV buffer failed");
     return -1;
   }
   memcpy(params->output_uv, uvm, uv_bytes);
   glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
 
-  if (check_gl_error("readback")) return -1;
+  if (check_gl_error(g, "readback")) return -1;
 
   return 0;
 }
 
-int yuv422_gpu_gles_convert_p010_dmabuf(int in_fd, int out_fd, uint32_t width, uint32_t height)
+int yuv422_gpu_gles_convert_p010_dmabuf(GpuCtx *g, int in_fd, int out_fd, uint32_t width, uint32_t height)
 {
+  if (!g) return -1;
   if (in_fd < 0 || out_fd < 0) {
-    snprintf(g.last_error, sizeof(g.last_error), "invalid dmabuf fd");
+    snprintf(g->last_error, sizeof(g->last_error), "invalid dmabuf fd");
     return -1;
   }
 
@@ -560,14 +585,14 @@ int yuv422_gpu_gles_convert_p010_dmabuf(int in_fd, int out_fd, uint32_t width, u
 
   void *in_map = mmap(NULL, in_bytes, PROT_READ, MAP_SHARED, in_fd, 0);
   if (in_map == MAP_FAILED) {
-    snprintf(g.last_error, sizeof(g.last_error), "mmap input dmabuf failed");
+    snprintf(g->last_error, sizeof(g->last_error), "mmap input dmabuf failed");
     return -1;
   }
 
   void *out_map = mmap(NULL, out_bytes, PROT_READ | PROT_WRITE, MAP_SHARED, out_fd, 0);
   if (out_map == MAP_FAILED) {
     munmap(in_map, in_bytes);
-    snprintf(g.last_error, sizeof(g.last_error), "mmap output dmabuf failed");
+    snprintf(g->last_error, sizeof(g->last_error), "mmap output dmabuf failed");
     return -1;
   }
 
@@ -580,33 +605,33 @@ int yuv422_gpu_gles_convert_p010_dmabuf(int in_fd, int out_fd, uint32_t width, u
   p.output_uv = (uint16_t *)((uint8_t *)out_map + y_bytes);
   p.output_format = OUTPUT_YUV420_P010;
 
-  int ret = yuv422_gpu_gles_convert_p010(&p);
+  int ret = yuv422_gpu_gles_convert_p010(g, &p);
 
   munmap(out_map, out_bytes);
   munmap(in_map, in_bytes);
   return ret;
 }
 
-int yuv422_gpu_gles_compute_p010_dmabuf(int in_fd, uint32_t width, uint32_t height)
+int yuv422_gpu_gles_compute_p010_dmabuf(GpuCtx *g, int in_fd, uint32_t width, uint32_t height)
 {
-  if (!g.initialized) return -1;
+  if (!g || !g->initialized) return -1;
   if (in_fd < 0 || width != 3840 || height != 2160) {
-    snprintf(g.last_error, sizeof(g.last_error), "invalid dmabuf input for compute path");
+    snprintf(g->last_error, sizeof(g->last_error), "invalid dmabuf input for compute path");
     return -1;
   }
-  if (!g.eglCreateImageKHR || !g.eglDestroyImageKHR || !g.glEGLImageTargetTexture2DOES) {
-    snprintf(g.last_error, sizeof(g.last_error), "EGL image import extensions missing");
+  if (!g->eglCreateImageKHR || !g->eglDestroyImageKHR || !g->glEGLImageTargetTexture2DOES) {
+    snprintf(g->last_error, sizeof(g->last_error), "EGL image import extensions missing");
     return -1;
   }
 
   pthread_t self_tid = pthread_self();
-  if (!g.context_bound || !pthread_equal(g.owner_thread, self_tid)) {
-    if (!eglMakeCurrent(g.egl_display, g.egl_surface, g.egl_surface, g.egl_context)) {
-      snprintf(g.last_error, sizeof(g.last_error), "eglMakeCurrent failed in compute dmabuf");
+  if (!g->context_bound || !pthread_equal(g->owner_thread, self_tid)) {
+    if (!eglMakeCurrent(g->egl_display, g->egl_surface, g->egl_surface, g->egl_context)) {
+      snprintf(g->last_error, sizeof(g->last_error), "eglMakeCurrent failed in compute dmabuf");
       return -1;
     }
-    g.context_bound = 1;
-    g.owner_thread = self_tid;
+    g->context_bound = 1;
+    g->owner_thread = self_tid;
   }
 
   EGLint attrs[] = {
@@ -619,9 +644,9 @@ int yuv422_gpu_gles_compute_p010_dmabuf(int in_fd, uint32_t width, uint32_t heig
     EGL_NONE
   };
 
-  EGLImageKHR image = g.eglCreateImageKHR(g.egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attrs);
+  EGLImageKHR image = g->eglCreateImageKHR(g->egl_display, EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attrs);
   if (image == EGL_NO_IMAGE_KHR) {
-    snprintf(g.last_error, sizeof(g.last_error), "eglCreateImageKHR(dmabuf) failed");
+    snprintf(g->last_error, sizeof(g->last_error), "eglCreateImageKHR(dmabuf) failed");
     return -1;
   }
 
@@ -629,76 +654,81 @@ int yuv422_gpu_gles_compute_p010_dmabuf(int in_fd, uint32_t width, uint32_t heig
   uint32_t y_bytes = width * height * 2;
   uint32_t uv_bytes = (width / 2) * (height / 2) * 4;
 
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_in);
-  if (g.alloc_in_bytes < in_bytes) { glBufferData(GL_SHADER_STORAGE_BUFFER, in_bytes, NULL, GL_DYNAMIC_DRAW); g.alloc_in_bytes = in_bytes; }
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g.ssbo_in);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->ssbo_in);
+  if (g->alloc_in_bytes < in_bytes) { glBufferData(GL_SHADER_STORAGE_BUFFER, in_bytes, NULL, GL_DYNAMIC_DRAW); g->alloc_in_bytes = in_bytes; }
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, g->ssbo_in);
 
-  glBindTexture(GL_TEXTURE_2D, g.tex_in);
+  glBindTexture(GL_TEXTURE_2D, g->tex_in);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
   glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-  g.glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
+  g->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, (GLeglImageOES)image);
 
-  glUseProgram(g.program_pack);
+  glUseProgram(g->program_pack);
   glActiveTexture(GL_TEXTURE0);
-  glBindTexture(GL_TEXTURE_2D, g.tex_in);
-  glUniform1i(g.loc_pack_tex, 0);
+  glBindTexture(GL_TEXTURE_2D, g->tex_in);
+  glUniform1i(g->loc_pack_tex, 0);
   glDispatchCompute((2400 + 63) / 64, 2160, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_y);
-  if (g.alloc_y_bytes < y_bytes) { glBufferData(GL_SHADER_STORAGE_BUFFER, y_bytes, NULL, GL_DYNAMIC_DRAW); g.alloc_y_bytes = y_bytes; }
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g.ssbo_y);
-  glUseProgram(g.program_y);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->ssbo_y);
+  if (g->alloc_y_bytes < y_bytes) { glBufferData(GL_SHADER_STORAGE_BUFFER, y_bytes, NULL, GL_DYNAMIC_DRAW); g->alloc_y_bytes = y_bytes; }
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g->ssbo_y);
+  glUseProgram(g->program_y);
   glDispatchCompute(60, 2160, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_uv);
-  if (g.alloc_uv_bytes < uv_bytes) { glBufferData(GL_SHADER_STORAGE_BUFFER, uv_bytes, NULL, GL_DYNAMIC_DRAW); g.alloc_uv_bytes = uv_bytes; }
-  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g.ssbo_uv);
-  glUseProgram(g.program_uv);
+  glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->ssbo_uv);
+  if (g->alloc_uv_bytes < uv_bytes) { glBufferData(GL_SHADER_STORAGE_BUFFER, uv_bytes, NULL, GL_DYNAMIC_DRAW); g->alloc_uv_bytes = uv_bytes; }
+  glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, g->ssbo_uv);
+  glUseProgram(g->program_uv);
   glDispatchCompute(60, 1080, 1);
   glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT);
 
-  GLsync fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+  GLsync sync_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
   glFlush();
-  glClientWaitSync(fence, GL_SYNC_FLUSH_COMMANDS_BIT, 5000000000ULL);
-  glDeleteSync(fence);
+  glClientWaitSync(sync_fence, GL_SYNC_FLUSH_COMMANDS_BIT, 5000000000ULL);
+  glDeleteSync(sync_fence);
 
-  g.eglDestroyImageKHR(g.egl_display, image);
+  g->eglDestroyImageKHR(g->egl_display, image);
   return 0;
 }
 
-void yuv422_gpu_gles_cleanup(void) {
-  if (!g.initialized)
+void yuv422_gpu_gles_cleanup(GpuCtx *g) {
+  if (!g)
     return;
-  if (g.mapped_in) {
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g.ssbo_in);
+  if (!g->initialized) {
+    free(g);
+    return;
+  }
+  if (g->mapped_in) {
+    glBindBuffer(GL_SHADER_STORAGE_BUFFER, g->ssbo_in);
     glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
-    g.mapped_in = NULL;
+    g->mapped_in = NULL;
   }
-  if (g.program_pack) glDeleteProgram(g.program_pack);
-  if (g.program_y) glDeleteProgram(g.program_y);
-  if (g.program_uv) glDeleteProgram(g.program_uv);
-  if (g.tex_in) glDeleteTextures(1, &g.tex_in);
-  if (g.ssbo_in) glDeleteBuffers(1, &g.ssbo_in);
-  if (g.ssbo_y) glDeleteBuffers(1, &g.ssbo_y);
-  if (g.ssbo_uv) glDeleteBuffers(1, &g.ssbo_uv);
-  if (g.egl_display != EGL_NO_DISPLAY) {
-    eglMakeCurrent(g.egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-    if (g.egl_surface != EGL_NO_SURFACE) eglDestroySurface(g.egl_display, g.egl_surface);
-    if (g.egl_context != EGL_NO_CONTEXT) eglDestroyContext(g.egl_display, g.egl_context);
-    eglTerminate(g.egl_display);
+  if (g->program_pack) glDeleteProgram(g->program_pack);
+  if (g->program_y) glDeleteProgram(g->program_y);
+  if (g->program_uv) glDeleteProgram(g->program_uv);
+  if (g->tex_in) glDeleteTextures(1, &g->tex_in);
+  if (g->ssbo_in) glDeleteBuffers(1, &g->ssbo_in);
+  if (g->ssbo_y) glDeleteBuffers(1, &g->ssbo_y);
+  if (g->ssbo_uv) glDeleteBuffers(1, &g->ssbo_uv);
+  if (g->egl_display != EGL_NO_DISPLAY) {
+    eglMakeCurrent(g->egl_display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+    if (g->egl_surface != EGL_NO_SURFACE) eglDestroySurface(g->egl_display, g->egl_surface);
+    if (g->egl_context != EGL_NO_CONTEXT) eglDestroyContext(g->egl_display, g->egl_context);
+    eglTerminate(g->egl_display);
   }
-  if (g.wl_egl_window) wl_egl_window_destroy(g.wl_egl_window);
-  if (g.wl_surface) wl_surface_destroy(g.wl_surface);
-  if (g.wl_compositor) wl_compositor_destroy(g.wl_compositor);
-  if (g.wl_registry) wl_registry_destroy(g.wl_registry);
-  if (g.wl_display) wl_display_disconnect(g.wl_display);
-  memset(&g, 0, sizeof(g));
+  if (g->wl_egl_window) wl_egl_window_destroy(g->wl_egl_window);
+  if (g->wl_surface) wl_surface_destroy(g->wl_surface);
+  if (g->wl_compositor) wl_compositor_destroy(g->wl_compositor);
+  if (g->wl_registry) wl_registry_destroy(g->wl_registry);
+  if (g->wl_display) wl_display_disconnect(g->wl_display);
+  free(g);
 }
 
-const char *yuv422_gpu_gles_last_error(void) {
-  return g.last_error;
+const char *yuv422_gpu_gles_last_error(GpuCtx *g) {
+  if (!g) return "NULL context";
+  return g->last_error;
 }
