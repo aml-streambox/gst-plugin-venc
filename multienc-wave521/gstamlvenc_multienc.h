@@ -133,6 +133,12 @@ struct _GstAmlVEnc
   ReorderFrame reorder_queue[MAX_REORDER_FRAMES];
   GstClockTime frame_duration;
 
+  /* Cached codec header for first-output prepend, used to preserve HEVC
+   * VPS/SPS/PPS VUI metadata in delayed-output B-frame modes. */
+  guint8 *codec_header;
+  guint codec_header_size;
+  gboolean codec_header_sent;
+
   struct roi_info {
     guint srcid;
     gboolean enabled;

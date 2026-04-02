@@ -930,6 +930,16 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encode_info.enc_feature_opts |= 0x1;  // enable roi function
   encode_info.internal_bit_depth = encoder->internal_bit_depth;
   encode_info.gop_pattern = encoder->gop_pattern;
+  switch (encoder->gop_pattern) {
+    case 1: /* IBBBP */
+      encode_info.enc_feature_opts |= (3 << 2);
+      break;
+    case 4: /* ALL_I */
+      encode_info.enc_feature_opts |= (1 << 2);
+      break;
+    default:
+      break;
+  }
   encode_info.rc_mode = encoder->rc_mode;
   encode_info.lossless_enable = encoder->lossless_enable;
   /* FIX: For lossless encoding, increase bitstream buffer size if not explicitly set */
@@ -943,7 +953,20 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
     }
   }
   encode_info.bitstream_buf_sz_kb = encoder->encoder_bufsize / 1024;
+
+  if (encoder->codec.buf == NULL) {
+    encoder->codec.buf = g_malloc0 (encoder->encoder_bufsize);
+  } else {
+    encoder->codec.buf = g_realloc (encoder->codec.buf, encoder->encoder_bufsize);
+  }
+
   encoder->v10conv.enabled = (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_ENCODED);
+  encoder->codec_header_sent = FALSE;
+  if (encoder->codec_header) {
+    g_free (encoder->codec_header);
+    encoder->codec_header = NULL;
+    encoder->codec_header_size = 0;
+  }
 
   /* VUI color signaling: read colorimetry from incoming caps and convert to
    * ITU-T H.273 integer codes for the H.264/H.265 SPS VUI.  This covers all
@@ -1130,6 +1153,27 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
     encoder->imgproc.outbuf_size = (info->width * info->height * 3) / 2;
   }
 
+  if (encoder->codec.handle != 0 && encoder->codec.id == CODEC_ID_H265 && encoder->bframe_enabled) {
+    guint header_alloc = MAX (encoder->encoder_bufsize, 256u) * 1024;
+    guint8 *header = g_malloc0 (header_alloc);
+    guint header_size = header_alloc;
+    encoding_metadata_t header_meta;
+
+    header_meta = vl_multi_encoder_generate_header (encoder->codec.handle,
+        header, &header_size);
+    if (header_meta.is_valid && header_size > 0) {
+      encoder->codec_header = header;
+      encoder->codec_header_size = header_size;
+      GST_INFO_OBJECT (encoder, "cached codec header size=%u for first output prepend",
+          encoder->codec_header_size);
+    } else {
+      GST_WARNING_OBJECT (encoder,
+          "failed to cache codec header for first output prepend (valid=%d size=%u err=%d)",
+          header_meta.is_valid, header_size, header_meta.err_cod);
+      g_free (header);
+    }
+  }
+
   return TRUE;
 }
 
@@ -1257,6 +1301,12 @@ gst_amlvenc_close_encoder (GstAmlVEnc * encoder)
     imgproc_deinit(encoder->imgproc.handle);
     encoder->imgproc.handle = NULL;
   }
+  if (encoder->codec_header) {
+    g_free (encoder->codec_header);
+    encoder->codec_header = NULL;
+    encoder->codec_header_size = 0;
+    encoder->codec_header_sent = FALSE;
+  }
 }
 
 static gboolean
@@ -1360,73 +1410,41 @@ gst_amlvenc_set_src_caps (GstAmlVEnc * encoder, GstCaps * caps)
   return TRUE;
 }
 
-/* Calculate correct DTS for B-frame GOP structures
- * Based on the backup code implementation
- */
+/* Wave521 multienc currently emits access units in presentation order even
+ * when B-frames are enabled. For this userspace path, using synthetic decode
+ * order timestamps causes invalid DTS > PTS relationships in MPEG-TS. Keep
+ * DTS equal to PTS and rely on the firmware bitstream ordering. */
 static GstClockTime
 gst_amlvenc_calculate_dts (GstAmlVEnc * encoder, GstVideoCodecFrame * frame, 
                            GstClockTime pts, gint frame_num)
 {
-  GstClockTime dts;
-  gint frame_in_gop;
-  
-  if (!encoder->bframe_enabled || encoder->frame_duration == GST_CLOCK_TIME_NONE) {
-    /* No B-frames: DTS = PTS */
-    return pts;
+  GST_LOG_OBJECT (encoder,
+      "Using DTS=PTS for frame %d with GOP pattern %d: %" GST_TIME_FORMAT,
+      frame_num, encoder->gop_pattern, GST_TIME_ARGS (pts));
+  return pts;
+}
+
+static GstVideoCodecFrame *
+gst_amlvenc_get_output_frame (GstAmlVEnc *encoder, GstVideoEncoder *video_enc,
+    const encoding_metadata_t *meta)
+{
+  GstVideoCodecFrame *frame = NULL;
+
+  if (meta && meta->input_frame_num >= 0) {
+    frame = gst_video_encoder_get_frame (video_enc, (guint32) meta->input_frame_num);
+    if (frame) {
+      GST_LOG_OBJECT (encoder,
+          "matched output to input frame_num=%d type=%d",
+          meta->input_frame_num, meta->extra.frame_type);
+      return frame;
+    }
+
+    GST_WARNING_OBJECT (encoder,
+        "failed to match output frame_num=%d, falling back to oldest pending frame",
+        meta->input_frame_num);
   }
-  
-  frame_in_gop = frame_num % encoder->gop_size;
-  
-  /* For B-frame GOPs, calculate DTS based on decode order */
-  switch (encoder->gop_pattern) {
-    case 1: /* IBBBP: Decode order I,P,B,B,B (display order: I,B,B,B,P) */
-      if (frame_in_gop == 0) {
-        /* I frame: DTS = PTS */
-        dts = pts;
-      } else if (frame_in_gop == encoder->gop_size - 1) {
-        /* P frame: DTS comes right after I */
-        dts = pts - (encoder->gop_size - 1) * encoder->frame_duration;
-      } else {
-        /* B frames: DTS follows P frame */
-        dts = pts + (encoder->gop_size - 1 - frame_in_gop) * encoder->frame_duration;
-      }
-      break;
-      
-    case 2: /* IBPBP: Decode order I,P,B,P,B... (display order: I,B,P,B,P...) */
-      if (frame_in_gop == 0) {
-        /* I frame */
-        dts = pts;
-      } else if (frame_in_gop % 2 == 0) {
-        /* P frames at even positions (2, 4, 6...) */
-        dts = pts - encoder->frame_duration;
-      } else {
-        /* B frames at odd positions (1, 3, 5...) */
-        dts = pts + encoder->frame_duration;
-      }
-      break;
-      
-    case 3: /* IBBB: All B frames reference only I */
-      if (frame_in_gop == 0) {
-        /* I frame */
-        dts = pts;
-      } else {
-        /* B frames: decode after I but display at their position */
-        dts = pts - frame_in_gop * encoder->frame_duration + encoder->frame_duration;
-      }
-      break;
-      
-    default:
-      /* IPP or ALL_I: DTS = PTS */
-      dts = pts;
-      break;
-  }
-  
-  GST_LOG_OBJECT (encoder, "Calculated DTS for frame %d (GOP pos %d, pattern %d): "
-                  "PTS=%" GST_TIME_FORMAT " DTS=%" GST_TIME_FORMAT,
-                  frame_num, frame_in_gop, encoder->gop_pattern,
-                  GST_TIME_ARGS(pts), GST_TIME_ARGS(dts));
-  
-  return dts;
+
+  return gst_video_encoder_get_oldest_frame (video_enc);
 }
 
 static void
@@ -1623,8 +1641,8 @@ gst_amlvenc_finish (GstVideoEncoder * video_enc)
     g_mutex_unlock (&encoder->encoder_lock);
 
     if (meta.is_valid) {
-      GstVideoCodecFrame *frame =
-          gst_video_encoder_get_oldest_frame(video_enc);
+        GstVideoCodecFrame *frame =
+            gst_amlvenc_get_output_frame (encoder, video_enc, &meta);
       if (frame) {
         GstMapInfo map;
         frame->output_buffer = gst_video_encoder_allocate_output_buffer(
@@ -1641,8 +1659,9 @@ gst_amlvenc_finish (GstVideoEncoder * video_enc)
               1, GST_SECOND, info->fps_n / info->fps_d);
           frame->pts = GST_BUFFER_TIMESTAMP(frame->input_buffer);
         }
-        /* Use DTS calculation for B-frame support in finish() path */
-        frame->dts = gst_amlvenc_calculate_dts (encoder, frame, frame->pts, encoder->dbg_frame_num);
+        /* Use original input order for B-frame DTS handling */
+        frame->dts = gst_amlvenc_calculate_dts (encoder, frame, frame->pts,
+            meta.input_frame_num >= 0 ? meta.input_frame_num : encoder->dbg_frame_num);
 
         GST_WARNING_OBJECT(encoder, "Vulkan pipeline flush: finishing last frame pts=%" G_GINT64_FORMAT,
             (gint64)frame->pts);
@@ -1662,83 +1681,17 @@ static gboolean
 gst_amlvenc_propose_allocation (GstVideoEncoder * encoder, GstQuery * query)
 {
   GstAmlVEnc *self = GST_AMLVENC (encoder);
-  GstVideoInfo *info;
-  guint size, min = 0, max = 0;
-  GstCaps *caps;
-  GstBufferPool *pool = NULL;
-  gboolean need_pool = FALSE;
 
   if (!self->input_state)
     return FALSE;
 
-  info = &self->input_state->info;
-
-  if (info) {
-      switch (GST_VIDEO_INFO_FORMAT(info)) {
-      case GST_VIDEO_FORMAT_NV12:
-      case GST_VIDEO_FORMAT_NV21:
-          {
-            GST_DEBUG_OBJECT(encoder, "choose gst_drm_bufferpool");
-            gst_query_parse_allocation(query, &caps, &need_pool);
-            GST_DEBUG_OBJECT(encoder, "need_pool: %d", need_pool);
-
-              if (need_pool) {
-                      pool = gst_drm_bufferpool_new(FALSE, GST_DRM_BUFFERPOOL_TYPE_VIDEO_PLANE);
-                      GST_DEBUG_OBJECT(encoder, "new gst_drm_bufferpool");
-                  }
-
-              gst_query_add_allocation_pool(query, pool, info->size, DRMBP_EXTRA_BUF_SIZE_FOR_DISPLAY, DRMBP_LIMIT_MAX_BUFSIZE_TO_BUFSIZE);
-              GST_DEBUG_OBJECT(encoder, "info->size: %d", info->size);
-                      if (pool)
-                      g_object_unref(pool);
-
-              gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
-
-          break;
-          }
-      default: //hanle not NV12/NV21
-          {
-            GST_DEBUG_OBJECT(encoder, "choose fake bufferpool");
-            if (gst_query_get_n_allocation_pools (query) > 0) {
-              gst_query_parse_nth_allocation_pool (query, 0, NULL, &size, &min, &max);
-              size = MAX (size, info->size);
-              gst_query_set_nth_allocation_pool (query, 0, NULL, size, self->min_buffers, self->max_buffers);
-            } else {
-              gst_query_add_allocation_pool (query, NULL, info->size, self->min_buffers, self->max_buffers);
-              GST_DEBUG_OBJECT(encoder, "info->size: %d", info->size);
-            }
-
-              gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
-          break;
-          }
-      }
-  } else {
-        GST_DEBUG_OBJECT(encoder, "can not get videoinfo");
-        return FALSE;
-  }
-
- if (self->b_enable_dmallocator) {
-    GstAllocator *allocator = NULL;
-    GstAllocationParams params;
-    /* we got configuration from our peer or the decide_allocation method,
-     * parse them */
-    if (gst_query_get_n_allocation_params (query) > 0) {
-       gst_query_parse_nth_allocation_param (query, 0, &allocator, &params);
-    } else {
-      allocator = NULL;
-      gst_allocation_params_init (&params);
-    }
-
-    /* For the camera + jpegdec + encoder case,jpegdec use videobuffer pool which is software allocate.
-    caused cp memory to dmabuffer during encoder frame.
-    currently,provide the dmaallocator to upstreamer element to avoid copy(optimize)
-    Try to update allocator*/
-    if (self->dmabuf_alloc)
-      gst_query_add_allocation_param (query, self->dmabuf_alloc, &params);
-
-    if (allocator)
-      gst_object_unref (allocator);
-  }
+  /*
+   * Do not force a custom upstream pool/allocator from the encoder side.
+   * Hardware decoder pipelines already negotiate their own DMABuf pool, and
+   * pushing encoder-specific pool proposals upstream breaks hwdec->hwenc
+   * allocation on T7. Keep negotiation minimal and only advertise video meta.
+   */
+  gst_query_add_allocation_meta (query, GST_VIDEO_META_API_TYPE, NULL);
 
   return GST_VIDEO_ENCODER_CLASS (parent_class)->propose_allocation (encoder,
       query);
@@ -2215,21 +2168,43 @@ v10conv_pipeline_encode:
     }
   }
 
+  if (meta.encoded_data_length_in_bytes == 0) {
+    GST_LOG_OBJECT (encoder,
+        "encoder produced no output yet (reorder delay or delayed picture)");
+    if (frame) {
+      gst_video_codec_frame_unref (frame);
+    }
+    return GST_FLOW_OK;
+  }
+
   if (frame) {
     gst_video_codec_frame_unref (frame);
   }
 
-  //frame = gst_video_encoder_get_frame (GST_VIDEO_ENCODER (encoder), input_frame->system_frame_number);
-  frame = gst_video_encoder_get_oldest_frame (GST_VIDEO_ENCODER (encoder));
+  frame = gst_amlvenc_get_output_frame (encoder, GST_VIDEO_ENCODER (encoder), &meta);
   if (!frame) {
     GST_ERROR_OBJECT (encoder, "No pending frame available after encoding");
     return GST_FLOW_ERROR;
   }
 
+  guint out_size = meta.encoded_data_length_in_bytes;
+  gboolean prepend_header = (encoder->bframe_enabled && !encoder->codec_header_sent &&
+      encoder->codec_header && encoder->codec_header_size > 0);
+  if (prepend_header) {
+    out_size += encoder->codec_header_size;
+  }
+
   frame->output_buffer = gst_video_encoder_allocate_output_buffer(
-      GST_VIDEO_ENCODER(encoder), meta.encoded_data_length_in_bytes);
+      GST_VIDEO_ENCODER(encoder), out_size);
   gst_buffer_map(frame->output_buffer, &map, GST_MAP_WRITE);
-  memcpy (map.data, encoder->codec.buf, meta.encoded_data_length_in_bytes);
+  if (prepend_header) {
+    memcpy (map.data, encoder->codec_header, encoder->codec_header_size);
+    memcpy (map.data + encoder->codec_header_size, encoder->codec.buf,
+        meta.encoded_data_length_in_bytes);
+    encoder->codec_header_sent = TRUE;
+  } else {
+    memcpy (map.data, encoder->codec.buf, meta.encoded_data_length_in_bytes);
+  }
   gst_buffer_unmap (frame->output_buffer, &map);
 
   /*
@@ -2254,13 +2229,14 @@ v10conv_pipeline_encode:
    * We use the dbg_frame_num counter as the frame number for timestamp calculation
    * This will correctly calculate DTS based on GOP pattern
    */
-  frame->dts = gst_amlvenc_calculate_dts (encoder, frame, frame->pts, encoder->dbg_frame_num);
+  frame->dts = gst_amlvenc_calculate_dts (encoder, frame, frame->pts,
+      meta.input_frame_num >= 0 ? meta.input_frame_num : encoder->dbg_frame_num);
 
   GST_LOG_OBJECT (encoder,
       "output: dts %" G_GINT64_FORMAT " pts %" G_GINT64_FORMAT " (B-frame enabled: %d, GOP pattern: %d)",
       (gint64) frame->dts, (gint64) frame->pts, encoder->bframe_enabled, encoder->gop_pattern);
 
-  if (frame_type == FRAME_TYPE_IDR) {
+  if (meta.extra.frame_type == FRAME_TYPE_IDR || meta.extra.frame_type == FRAME_TYPE_I) {
     GST_DEBUG_OBJECT (encoder, "Output keyframe");
     GST_VIDEO_CODEC_FRAME_SET_SYNC_POINT (frame);
   } else {
