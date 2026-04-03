@@ -129,9 +129,11 @@ struct _GstAmlVEnc
   gboolean bframe_enabled;
   gint gop_size;
   gint frame_counter;
+  gint output_counter;
   gint reorder_count;
   ReorderFrame reorder_queue[MAX_REORDER_FRAMES];
   GstClockTime frame_duration;
+  GstClockTime bframe_base_pts;
 
   /* Cached codec header for first-output prepend, used to preserve HEVC
    * VPS/SPS/PPS VUI metadata in delayed-output B-frame modes. */

@@ -961,6 +961,8 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   }
 
   encoder->v10conv.enabled = (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_ENCODED);
+  encoder->output_counter = 0;
+  encoder->bframe_base_pts = GST_CLOCK_TIME_NONE;
   encoder->codec_header_sent = FALSE;
   if (encoder->codec_header) {
     g_free (encoder->codec_header);
@@ -1410,18 +1412,68 @@ gst_amlvenc_set_src_caps (GstAmlVEnc * encoder, GstCaps * caps)
   return TRUE;
 }
 
-/* Wave521 multienc currently emits access units in presentation order even
- * when B-frames are enabled. For this userspace path, using synthetic decode
- * order timestamps causes invalid DTS > PTS relationships in MPEG-TS. Keep
- * DTS equal to PTS and rely on the firmware bitstream ordering. */
+/* Wave521 multienc reports the original display-order frame index via
+ * input_frame_num while emitting access units in decode order for B-frame GOPs.
+ * Use matched input-frame PTS as display PTS, but generate monotonic DTS from
+ * output order with a fixed initial lead so DTS stays <= PTS. */
 static GstClockTime
 gst_amlvenc_calculate_dts (GstAmlVEnc * encoder, GstVideoCodecFrame * frame, 
                            GstClockTime pts, gint frame_num)
 {
+  GstClockTime dts;
+
+  if (!encoder->bframe_enabled || encoder->frame_duration == GST_CLOCK_TIME_NONE)
+    return pts;
+
+  switch (encoder->gop_pattern) {
+    case 1: /* IBBBP */
+    case 2: /* IBPBP */
+    case 3: /* IBBB */
+      break;
+    default:
+      return pts;
+  }
+
+  if (encoder->bframe_base_pts == GST_CLOCK_TIME_NONE)
+    encoder->bframe_base_pts = pts;
+
+  dts = encoder->bframe_base_pts + ((gint64) encoder->output_counter * encoder->frame_duration);
+
   GST_LOG_OBJECT (encoder,
-      "Using DTS=PTS for frame %d with GOP pattern %d: %" GST_TIME_FORMAT,
-      frame_num, encoder->gop_pattern, GST_TIME_ARGS (pts));
-  return pts;
+      "Calculated B-frame DTS for display frame %d output_idx=%d pattern=%d: PTS=%" GST_TIME_FORMAT " DTS=%" GST_TIME_FORMAT,
+      frame_num, encoder->output_counter, encoder->gop_pattern,
+      GST_TIME_ARGS (pts), GST_TIME_ARGS (dts));
+
+  return dts;
+}
+
+static GstClockTime
+gst_amlvenc_adjust_bframe_pts (GstAmlVEnc *encoder, GstClockTime pts, gint frame_num)
+{
+  gint lead_frames = 0;
+
+  if (!encoder->bframe_enabled || encoder->frame_duration == GST_CLOCK_TIME_NONE)
+    return pts;
+
+  switch (encoder->gop_pattern) {
+    case 1:
+      lead_frames = 5;
+      break;
+    case 2:
+      lead_frames = 3;
+      break;
+    case 3:
+      lead_frames = 4;
+      break;
+    default:
+      return pts;
+  }
+
+  if (encoder->bframe_base_pts == GST_CLOCK_TIME_NONE)
+    encoder->bframe_base_pts = pts;
+
+  return encoder->bframe_base_pts +
+      ((gint64) (frame_num + lead_frames) * encoder->frame_duration);
 }
 
 static GstVideoCodecFrame *
@@ -1659,12 +1711,15 @@ gst_amlvenc_finish (GstVideoEncoder * video_enc)
               1, GST_SECOND, info->fps_n / info->fps_d);
           frame->pts = GST_BUFFER_TIMESTAMP(frame->input_buffer);
         }
+        frame->pts = gst_amlvenc_adjust_bframe_pts (encoder, frame->pts,
+            meta.input_frame_num >= 0 ? meta.input_frame_num : 0);
         /* Use original input order for B-frame DTS handling */
         frame->dts = gst_amlvenc_calculate_dts (encoder, frame, frame->pts,
             meta.input_frame_num >= 0 ? meta.input_frame_num : encoder->dbg_frame_num);
 
         GST_WARNING_OBJECT(encoder, "Vulkan pipeline flush: finishing last frame pts=%" G_GINT64_FORMAT,
             (gint64)frame->pts);
+        encoder->output_counter++;
         gst_video_encoder_finish_frame(video_enc, frame);
       }
     } else {
@@ -2225,6 +2280,9 @@ v10conv_pipeline_encode:
       }
   }
 
+  frame->pts = gst_amlvenc_adjust_bframe_pts (encoder, frame->pts,
+      meta.input_frame_num >= 0 ? meta.input_frame_num : 0);
+
   /* Use the new DTS calculation function for B-frame support
    * We use the dbg_frame_num counter as the frame number for timestamp calculation
    * This will correctly calculate DTS based on GOP pattern
@@ -2235,6 +2293,8 @@ v10conv_pipeline_encode:
   GST_LOG_OBJECT (encoder,
       "output: dts %" G_GINT64_FORMAT " pts %" G_GINT64_FORMAT " (B-frame enabled: %d, GOP pattern: %d)",
       (gint64) frame->dts, (gint64) frame->pts, encoder->bframe_enabled, encoder->gop_pattern);
+
+  encoder->output_counter++;
 
   if (meta.extra.frame_type == FRAME_TYPE_IDR || meta.extra.frame_type == FRAME_TYPE_I) {
     GST_DEBUG_OBJECT (encoder, "Output keyframe");
