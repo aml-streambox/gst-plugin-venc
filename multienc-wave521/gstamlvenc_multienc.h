@@ -106,6 +106,8 @@ struct _GstAmlVEnc
   gboolean lossless_enable;
   
   /* B-frame QP properties */
+  gint qp_i;
+  gint qp_p;
   gint qp_b;
   gint min_qp_b;
   gint max_qp_b;

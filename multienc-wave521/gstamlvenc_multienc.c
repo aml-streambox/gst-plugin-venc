@@ -196,6 +196,8 @@ gst_amlvenc_gop_pattern_delay_frames (gint gop_pattern)
 #define PROP_LOSSLESS_ENABLE_DEFAULT FALSE
 #define PROP_V10CONV_BACKEND_DEFAULT 0  /* 0=vulkan, 1=gles */
 
+#define PROP_QP_I_DEFAULT 30
+#define PROP_QP_P_DEFAULT 30
 #define PROP_QP_B_DEFAULT 0
 #define PROP_MIN_QP_B_DEFAULT 8
 #define PROP_MAX_QP_B_DEFAULT 51
@@ -353,6 +355,8 @@ enum
   PROP_GOP_PATTERN,
   PROP_RC_MODE,
   PROP_LOSSLESS_ENABLE,
+  PROP_QP_I,
+  PROP_QP_P,
   PROP_QP_B,
   PROP_MIN_QP_B,
   PROP_MAX_QP_B,
@@ -723,6 +727,16 @@ gst_amlvenc_class_init (GstAmlVEncClass * klass)
           PROP_LOSSLESS_ENABLE_DEFAULT,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
+  g_object_class_install_property (gobject_class, PROP_QP_I,
+      g_param_spec_int("qp-i", "qp-i", "Base QP for I-frames",
+          0, 51, PROP_QP_I_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
+  g_object_class_install_property (gobject_class, PROP_QP_P,
+      g_param_spec_int("qp-p", "qp-p", "Base QP for P-frames",
+          0, 51, PROP_QP_P_DEFAULT,
+          G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
+
   g_object_class_install_property (gobject_class, PROP_QP_B,
       g_param_spec_int("qp-b", "qp-b", "Base QP for B-frames (0=auto)",
           0, 51, PROP_QP_B_DEFAULT,
@@ -792,6 +806,8 @@ gst_amlvenc_init (GstAmlVEnc * encoder)
   encoder->v10conv_backend = PROP_V10CONV_BACKEND_DEFAULT;
   
   /* B-frame QP properties */
+  encoder->qp_i = PROP_QP_I_DEFAULT;
+  encoder->qp_p = PROP_QP_P_DEFAULT;
   encoder->qp_b = PROP_QP_B_DEFAULT;
   encoder->min_qp_b = PROP_MIN_QP_B_DEFAULT;
   encoder->max_qp_b = PROP_MAX_QP_B_DEFAULT;
@@ -1131,10 +1147,10 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
 
   qp_tbl.qp_min = 0;
   qp_tbl.qp_max = 51;
-  qp_tbl.qp_I_base = 30;
+  qp_tbl.qp_I_base = encoder->qp_i;
   qp_tbl.qp_I_min = 0;
   qp_tbl.qp_I_max = 51;
-  qp_tbl.qp_P_base = 30;
+  qp_tbl.qp_P_base = encoder->qp_p;
   qp_tbl.qp_P_min = 0;
   qp_tbl.qp_P_max = 51;
   qp_tbl.qp_B_base = encoder->qp_b;
@@ -2340,6 +2356,12 @@ gst_amlvenc_get_property (GObject * object, guint prop_id,
     case PROP_LOSSLESS_ENABLE:
       g_value_set_boolean (value, encoder->lossless_enable);
       break;
+    case PROP_QP_I:
+      g_value_set_int (value, encoder->qp_i);
+      break;
+    case PROP_QP_P:
+      g_value_set_int (value, encoder->qp_p);
+      break;
     case PROP_QP_B:
       g_value_set_int (value, encoder->qp_b);
       break;
@@ -2444,6 +2466,14 @@ gst_amlvenc_set_property (GObject * object, guint prop_id,
       break;
     case PROP_LOSSLESS_ENABLE:
       encoder->lossless_enable = g_value_get_boolean (value);
+      break;
+    case PROP_QP_I:
+      encoder->qp_i = g_value_get_int (value);
+      GST_LOG_OBJECT (encoder, "qp-i set to %d", encoder->qp_i);
+      break;
+    case PROP_QP_P:
+      encoder->qp_p = g_value_get_int (value);
+      GST_LOG_OBJECT (encoder, "qp-p set to %d", encoder->qp_p);
       break;
     case PROP_QP_B:
       encoder->qp_b = g_value_get_int (value);
