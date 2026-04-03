@@ -93,6 +93,104 @@ gst_amlvenc_add_v_chroma_format (GstAmlVEnc *encoder, GstStructure * s)
   return ret;
 }
 
+static const gchar *
+gst_amlvenc_gop_pattern_name (gint gop_pattern)
+{
+  switch (gop_pattern) {
+    case 0:
+      return "IPP";
+    case 1:
+      return "IBBBP";
+    case 2:
+      return "IBPBP";
+    case 3:
+      return "IBBB";
+    case 4:
+      return "ALL_I";
+    case 5:
+      return "IPPPP";
+    case 6:
+      return "IBBBB";
+    case 7:
+      return "RA_IB";
+    case 8:
+      return "IPP_SINGLE";
+    default:
+      return "UNKNOWN";
+  }
+}
+
+static gboolean
+gst_amlvenc_gop_pattern_has_bframes (gint gop_pattern)
+{
+  switch (gop_pattern) {
+    case 1:
+    case 2:
+    case 3:
+    case 6:
+    case 7:
+      return TRUE;
+    default:
+      return FALSE;
+  }
+}
+
+static gint
+gst_amlvenc_gop_pattern_cycle_size (gint gop_pattern)
+{
+  switch (gop_pattern) {
+    case 1:
+    case 3:
+    case 5:
+    case 6:
+      return 4;
+    case 2:
+      return 2;
+    case 7:
+      return 8;
+    default:
+      return 1;
+  }
+}
+
+static gint
+gst_amlvenc_gop_pattern_delay_frames (gint gop_pattern)
+{
+  switch (gop_pattern) {
+    case 1:
+      return 4;
+    case 2:
+      return 2;
+    case 3:
+      return 3;
+    case 6:
+      return 4;
+    case 7:
+      return 8;
+    default:
+      return 0;
+  }
+}
+
+static gint
+gst_amlvenc_gop_pattern_pts_lead (gint gop_pattern)
+{
+  switch (gop_pattern) {
+    case 1:
+      return 5;
+    case 2:
+      return 3;
+    case 3:
+      return 4;
+    case 6:
+      return 5;
+    case 7:
+      return 9;
+    default:
+      return 0;
+  }
+}
+
 #define PROP_IDR_PERIOD_DEFAULT 30
 #define PROP_FRAMERATE_DEFAULT 30
 #define PROP_BITRATE_DEFAULT 2000
@@ -629,8 +727,9 @@ gst_amlvenc_class_init (GstAmlVEncClass * klass)
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   g_object_class_install_property (gobject_class, PROP_GOP_PATTERN,
-      g_param_spec_int("gop-pattern", "gop-pattern", "GOP structure pattern (0=IP, 1=IBBBP, 2=IBPBP, 3=ALL_I)",
-          0, 4, PROP_GOP_PATTERN_DEFAULT,
+      g_param_spec_int("gop-pattern", "gop-pattern",
+          "GOP structure pattern (0=IPP, 1=IBBBP, 2=IBPBP, 3=IBBB, 4=ALL_I, 5=IPPPP, 6=IBBBB, 7=RA_IB, 8=IPP_SINGLE)",
+          0, 8, PROP_GOP_PATTERN_DEFAULT,
           G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS));
 
   g_object_class_install_property (gobject_class, PROP_RC_MODE,
@@ -930,16 +1029,6 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encode_info.enc_feature_opts |= 0x1;  // enable roi function
   encode_info.internal_bit_depth = encoder->internal_bit_depth;
   encode_info.gop_pattern = encoder->gop_pattern;
-  switch (encoder->gop_pattern) {
-    case 1: /* IBBBP */
-      encode_info.enc_feature_opts |= (3 << 2);
-      break;
-    case 4: /* ALL_I */
-      encode_info.enc_feature_opts |= (1 << 2);
-      break;
-    default:
-      break;
-  }
   encode_info.rc_mode = encoder->rc_mode;
   encode_info.lossless_enable = encoder->lossless_enable;
   /* FIX: For lossless encoding, increase bitstream buffer size if not explicitly set */
@@ -1117,29 +1206,13 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
     encoder->frame_duration = GST_SECOND / 30; /* default 30fps */
   }
   
-  /* Check if B-frames are enabled based on GOP pattern */
-  switch (encoder->gop_pattern) {
-    case 1: /* IBBBP */
-      encoder->bframe_enabled = TRUE;
-      encoder->gop_size = 4;
-      GST_INFO_OBJECT (encoder, "B-frames enabled: IBBBP pattern, GOP size %d", encoder->gop_size);
-      break;
-    case 2: /* IBPBP */
-      encoder->bframe_enabled = TRUE;
-      encoder->gop_size = 2;
-      GST_INFO_OBJECT (encoder, "B-frames enabled: IBPBP pattern, GOP size %d", encoder->gop_size);
-      break;
-    case 3: /* IBBB */
-      encoder->bframe_enabled = TRUE;
-      encoder->gop_size = 4;
-      GST_INFO_OBJECT (encoder, "B-frames enabled: IBBB pattern, GOP size %d", encoder->gop_size);
-      break;
-    default:
-      encoder->bframe_enabled = FALSE;
-      encoder->gop_size = 1;
-      GST_INFO_OBJECT (encoder, "B-frames disabled: GOP pattern %d", encoder->gop_pattern);
-      break;
-  }
+  encoder->bframe_enabled = gst_amlvenc_gop_pattern_has_bframes (encoder->gop_pattern);
+  encoder->gop_size = gst_amlvenc_gop_pattern_cycle_size (encoder->gop_pattern);
+
+  GST_INFO_OBJECT (encoder,
+      "%s preset selected: gop-pattern=%d gop-size=%d bframes=%d",
+      gst_amlvenc_gop_pattern_name (encoder->gop_pattern),
+      encoder->gop_pattern, encoder->gop_size, encoder->bframe_enabled);
   
   /* Clear reorder queue */
   memset(encoder->reorder_queue, 0, sizeof(encoder->reorder_queue));
@@ -1425,14 +1498,8 @@ gst_amlvenc_calculate_dts (GstAmlVEnc * encoder, GstVideoCodecFrame * frame,
   if (!encoder->bframe_enabled || encoder->frame_duration == GST_CLOCK_TIME_NONE)
     return pts;
 
-  switch (encoder->gop_pattern) {
-    case 1: /* IBBBP */
-    case 2: /* IBPBP */
-    case 3: /* IBBB */
-      break;
-    default:
-      return pts;
-  }
+  if (!gst_amlvenc_gop_pattern_has_bframes (encoder->gop_pattern))
+    return pts;
 
   if (encoder->bframe_base_pts == GST_CLOCK_TIME_NONE)
     encoder->bframe_base_pts = pts;
@@ -1450,24 +1517,14 @@ gst_amlvenc_calculate_dts (GstAmlVEnc * encoder, GstVideoCodecFrame * frame,
 static GstClockTime
 gst_amlvenc_adjust_bframe_pts (GstAmlVEnc *encoder, GstClockTime pts, gint frame_num)
 {
-  gint lead_frames = 0;
+  gint lead_frames;
 
   if (!encoder->bframe_enabled || encoder->frame_duration == GST_CLOCK_TIME_NONE)
     return pts;
 
-  switch (encoder->gop_pattern) {
-    case 1:
-      lead_frames = 5;
-      break;
-    case 2:
-      lead_frames = 3;
-      break;
-    case 3:
-      lead_frames = 4;
-      break;
-    default:
-      return pts;
-  }
+  lead_frames = gst_amlvenc_gop_pattern_pts_lead (encoder->gop_pattern);
+  if (lead_frames <= 0)
+    return pts;
 
   if (encoder->bframe_base_pts == GST_CLOCK_TIME_NONE)
     encoder->bframe_base_pts = pts;
@@ -1512,22 +1569,7 @@ gst_amlvenc_set_latency (GstAmlVEnc * encoder)
   gint max_delayed_frames;
   GstClockTime latency;
 
-  /* GOP patterns: 0=IPP, 1=IBBBP, 2=IBPBP, 3=IBBB, 4=ALL_I
-   * Calculate max_delayed_frames based on GOP pattern for B-frame support */
-  switch (encoder->gop_pattern) {
-    case 1: // IBBBP
-      max_delayed_frames = 4;  // 3 B-frames + 1 reorder delay
-      break;
-    case 2: // IBPBP
-      max_delayed_frames = 2;
-      break;
-    case 3: // IBBB
-      max_delayed_frames = 3;
-      break;
-    default: // IPP, ALL_I
-      max_delayed_frames = 0;
-      break;
-  }
+  max_delayed_frames = gst_amlvenc_gop_pattern_delay_frames (encoder->gop_pattern);
 
   if (info->fps_n) {
     latency = gst_util_uint64_scale_ceil (GST_SECOND * info->fps_d,
