@@ -172,25 +172,6 @@ gst_amlvenc_gop_pattern_delay_frames (gint gop_pattern)
   }
 }
 
-static gint
-gst_amlvenc_gop_pattern_pts_lead (gint gop_pattern)
-{
-  switch (gop_pattern) {
-    case 1:
-      return 5;
-    case 2:
-      return 3;
-    case 3:
-      return 4;
-    case 6:
-      return 5;
-    case 7:
-      return 9;
-    default:
-      return 0;
-  }
-}
-
 #define PROP_IDR_PERIOD_DEFAULT 30
 #define PROP_FRAMERATE_DEFAULT 30
 #define PROP_BITRATE_DEFAULT 2000
@@ -818,10 +799,7 @@ gst_amlvenc_init (GstAmlVEnc * encoder)
   /* B-frame reordering state */
   encoder->bframe_enabled = FALSE;
   encoder->gop_size = 1;
-  encoder->frame_counter = 0;
-  encoder->reorder_count = 0;
   encoder->frame_duration = GST_CLOCK_TIME_NONE;
-  memset(encoder->reorder_queue, 0, sizeof(encoder->reorder_queue));
 
   list_init(&encoder->roi.param_info);
   encoder->roi.srcid = 0;
@@ -1052,12 +1030,6 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encoder->v10conv.enabled = (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_ENCODED);
   encoder->output_counter = 0;
   encoder->bframe_base_pts = GST_CLOCK_TIME_NONE;
-  encoder->codec_header_sent = FALSE;
-  if (encoder->codec_header) {
-    g_free (encoder->codec_header);
-    encoder->codec_header = NULL;
-    encoder->codec_header_size = 0;
-  }
 
   /* VUI color signaling: read colorimetry from incoming caps and convert to
    * ITU-T H.273 integer codes for the H.264/H.265 SPS VUI.  This covers all
@@ -1118,7 +1090,7 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
         /* Update encoder framerate property to match source for logging/consistency */
         encoder->framerate = encode_info.frame_rate;
       }
-      if (!encoder->v10conv.gles_ctx) {
+      if (encoder->v10conv_backend == 1 && !encoder->v10conv.gles_ctx) {
         encoder->v10conv.gles_ctx = yuv422_gpu_gles_init ();
         if (!encoder->v10conv.gles_ctx) {
           GST_ELEMENT_ERROR (encoder, STREAM, ENCODE,
@@ -1193,9 +1165,7 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
     return FALSE;
   }
   
-  /* Initialize B-frame reordering state based on GOP pattern */
-  encoder->frame_counter = 0;
-  encoder->reorder_count = 0;
+  /* Initialize B-frame state based on GOP pattern */
   encoder->bframe_enabled = FALSE;
   encoder->gop_size = 1;
   
@@ -1214,9 +1184,6 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
       gst_amlvenc_gop_pattern_name (encoder->gop_pattern),
       encoder->gop_pattern, encoder->gop_size, encoder->bframe_enabled);
   
-  /* Clear reorder queue */
-  memset(encoder->reorder_queue, 0, sizeof(encoder->reorder_queue));
-
   if (GST_VIDEO_INFO_FORMAT(info) == GST_VIDEO_FORMAT_RGB ||
       GST_VIDEO_INFO_FORMAT(info) == GST_VIDEO_FORMAT_BGR) {
     encoder->imgproc.handle = imgproc_init();
@@ -1226,27 +1193,6 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
       return FALSE;
     }
     encoder->imgproc.outbuf_size = (info->width * info->height * 3) / 2;
-  }
-
-  if (encoder->codec.handle != 0 && encoder->codec.id == CODEC_ID_H265 && encoder->bframe_enabled) {
-    guint header_alloc = MAX (encoder->encoder_bufsize, 256u) * 1024;
-    guint8 *header = g_malloc0 (header_alloc);
-    guint header_size = header_alloc;
-    encoding_metadata_t header_meta;
-
-    header_meta = vl_multi_encoder_generate_header (encoder->codec.handle,
-        header, &header_size);
-    if (header_meta.is_valid && header_size > 0) {
-      encoder->codec_header = header;
-      encoder->codec_header_size = header_size;
-      GST_INFO_OBJECT (encoder, "cached codec header size=%u for first output prepend",
-          encoder->codec_header_size);
-    } else {
-      GST_WARNING_OBJECT (encoder,
-          "failed to cache codec header for first output prepend (valid=%d size=%u err=%d)",
-          header_meta.is_valid, header_size, header_meta.err_cod);
-      g_free (header);
-    }
   }
 
   return TRUE;
@@ -1375,12 +1321,6 @@ gst_amlvenc_close_encoder (GstAmlVEnc * encoder)
   if (encoder->imgproc.handle) {
     imgproc_deinit(encoder->imgproc.handle);
     encoder->imgproc.handle = NULL;
-  }
-  if (encoder->codec_header) {
-    g_free (encoder->codec_header);
-    encoder->codec_header = NULL;
-    encoder->codec_header_size = 0;
-    encoder->codec_header_sent = FALSE;
   }
 }
 
@@ -1512,25 +1452,6 @@ gst_amlvenc_calculate_dts (GstAmlVEnc * encoder, GstVideoCodecFrame * frame,
       GST_TIME_ARGS (pts), GST_TIME_ARGS (dts));
 
   return dts;
-}
-
-static GstClockTime
-gst_amlvenc_adjust_bframe_pts (GstAmlVEnc *encoder, GstClockTime pts, gint frame_num)
-{
-  gint lead_frames;
-
-  if (!encoder->bframe_enabled || encoder->frame_duration == GST_CLOCK_TIME_NONE)
-    return pts;
-
-  lead_frames = gst_amlvenc_gop_pattern_pts_lead (encoder->gop_pattern);
-  if (lead_frames <= 0)
-    return pts;
-
-  if (encoder->bframe_base_pts == GST_CLOCK_TIME_NONE)
-    encoder->bframe_base_pts = pts;
-
-  return encoder->bframe_base_pts +
-      ((gint64) (frame_num + lead_frames) * encoder->frame_duration);
 }
 
 static GstVideoCodecFrame *
@@ -1759,8 +1680,6 @@ gst_amlvenc_finish (GstVideoEncoder * video_enc)
               1, GST_SECOND, info->fps_n / info->fps_d);
           frame->pts = GST_BUFFER_TIMESTAMP(frame->input_buffer);
         }
-        frame->pts = gst_amlvenc_adjust_bframe_pts (encoder, frame->pts,
-            meta.input_frame_num >= 0 ? meta.input_frame_num : 0);
         /* Use original input order for B-frame DTS handling */
         frame->dts = gst_amlvenc_calculate_dts (encoder, frame, frame->pts,
             meta.input_frame_num >= 0 ? meta.input_frame_num : encoder->dbg_frame_num);
@@ -2325,9 +2244,6 @@ v10conv_pipeline_encode:
           encoder->u4_first_pts_index = 0;
       }
   }
-
-  frame->pts = gst_amlvenc_adjust_bframe_pts (encoder, frame->pts,
-      meta.input_frame_num >= 0 ? meta.input_frame_num : 0);
 
   /* Use the new DTS calculation function for B-frame support
    * We use the dbg_frame_num counter as the frame number for timestamp calculation

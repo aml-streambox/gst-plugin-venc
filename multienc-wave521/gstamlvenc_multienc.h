@@ -28,18 +28,6 @@ typedef struct GpuCtx GpuCtx;
 
 #define PTS_UINT_4_RESET 4294967295
 
-/* Maximum number of frames in reorder queue for B-frame support */
-#define MAX_REORDER_FRAMES 16
-
-/* Frame reordering info for B-frame timestamp handling */
-typedef struct {
-  GstVideoCodecFrame *frame;
-  GstClockTime pts;
-  GstClockTime dts;
-  gint frame_num;
-  gboolean is_output;
-} ReorderFrame;
-
 G_BEGIN_DECLS
 
 #define GST_TYPE_AMLVENC \
@@ -128,18 +116,9 @@ struct _GstAmlVEnc
   /* B-frame reordering state */
   gboolean bframe_enabled;
   gint gop_size;
-  gint frame_counter;
   gint output_counter;
-  gint reorder_count;
-  ReorderFrame reorder_queue[MAX_REORDER_FRAMES];
   GstClockTime frame_duration;
   GstClockTime bframe_base_pts;
-
-  /* Cached codec header for first-output prepend, used to preserve HEVC
-   * VPS/SPS/PPS VUI metadata in delayed-output B-frame modes. */
-  guint8 *codec_header;
-  guint codec_header_size;
-  gboolean codec_header_sent;
 
   struct roi_info {
     guint srcid;
