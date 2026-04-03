@@ -1486,17 +1486,23 @@ gst_amlvenc_get_output_frame (GstAmlVEnc *encoder, GstVideoEncoder *video_enc,
     frame = gst_video_encoder_get_frame (video_enc, (guint32) meta->input_frame_num);
     if (frame) {
       GST_LOG_OBJECT (encoder,
-          "matched output to input frame_num=%d type=%d",
-          meta->input_frame_num, meta->extra.frame_type);
+          "get_output_frame: matched input_frame_num=%d -> sfn=%u type=%d",
+          meta->input_frame_num, frame->system_frame_number, meta->extra.frame_type);
       return frame;
     }
 
     GST_WARNING_OBJECT (encoder,
-        "failed to match output frame_num=%d, falling back to oldest pending frame",
+        "get_output_frame: FAILED to match input_frame_num=%d, falling back to oldest",
         meta->input_frame_num);
   }
 
-  return gst_video_encoder_get_oldest_frame (video_enc);
+  frame = gst_video_encoder_get_oldest_frame (video_enc);
+  if (frame) {
+    GST_WARNING_OBJECT (encoder,
+        "get_output_frame: oldest fallback sfn=%u (wanted input_frame_num=%d)",
+        frame->system_frame_number, meta ? meta->input_frame_num : -999);
+  }
+  return frame;
 }
 
 static void
@@ -2242,24 +2248,22 @@ v10conv_pipeline_encode:
     return GST_FLOW_ERROR;
   }
 
+  GST_LOG_OBJECT (encoder,
+      "encode output: input_frame_num=%d frame_type=%d sfn=%u "
+      "pts=%" GST_TIME_FORMAT " bytes=%d",
+      meta.input_frame_num, meta.extra.frame_type, frame->system_frame_number,
+      GST_TIME_ARGS (frame->pts),
+      meta.encoded_data_length_in_bytes);
+
   guint out_size = meta.encoded_data_length_in_bytes;
-  gboolean prepend_header = (encoder->bframe_enabled && !encoder->codec_header_sent &&
-      encoder->codec_header && encoder->codec_header_size > 0);
-  if (prepend_header) {
-    out_size += encoder->codec_header_size;
-  }
+  /* NOTE: Library-level SPS/PPS prepend (mPrependSPSPPSToIDRFrames) handles
+   * header insertion for I-frames.  Plugin-level prepend is no longer needed
+   * now that delay frames are correctly suppressed in the library. */
 
   frame->output_buffer = gst_video_encoder_allocate_output_buffer(
       GST_VIDEO_ENCODER(encoder), out_size);
   gst_buffer_map(frame->output_buffer, &map, GST_MAP_WRITE);
-  if (prepend_header) {
-    memcpy (map.data, encoder->codec_header, encoder->codec_header_size);
-    memcpy (map.data + encoder->codec_header_size, encoder->codec.buf,
-        meta.encoded_data_length_in_bytes);
-    encoder->codec_header_sent = TRUE;
-  } else {
-    memcpy (map.data, encoder->codec.buf, meta.encoded_data_length_in_bytes);
-  }
+  memcpy (map.data, encoder->codec.buf, meta.encoded_data_length_in_bytes);
   gst_buffer_unmap (frame->output_buffer, &map);
 
   /*
