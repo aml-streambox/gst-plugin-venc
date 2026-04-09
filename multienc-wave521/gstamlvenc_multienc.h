@@ -149,6 +149,10 @@ struct _GstAmlVEnc
   unsigned long dbg_frame_num;
   gboolean logged_p010_stats;
 
+  /* CBR filler accounting */
+  guint64 cbr_target_bytes_scaled;
+  guint64 cbr_emitted_bytes;
+
 };
 
 struct _GstAmlVEncClass

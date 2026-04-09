@@ -153,6 +153,68 @@ gst_amlvenc_gop_pattern_cycle_size (gint gop_pattern)
   }
 }
 
+static guint
+gst_amlvenc_write_filler_nal (vl_codec_id_t codec_id, guint8 *dst, guint filler_bytes)
+{
+  guint header_bytes;
+  guint ff_bytes;
+
+  if (codec_id == CODEC_ID_H265) {
+    header_bytes = 2;
+    if (filler_bytes < 7)
+      return 0;
+  } else if (codec_id == CODEC_ID_H264) {
+    header_bytes = 1;
+    if (filler_bytes < 6)
+      return 0;
+  } else {
+    return 0;
+  }
+
+  dst[0] = 0x00;
+  dst[1] = 0x00;
+  dst[2] = 0x00;
+  dst[3] = 0x01;
+
+  if (codec_id == CODEC_ID_H265) {
+    dst[4] = 0x4c;
+    dst[5] = 0x01;
+  } else {
+    dst[4] = 0x0c;
+  }
+
+  ff_bytes = filler_bytes - 4 - header_bytes - 1;
+  if (ff_bytes > 0)
+    memset (dst + 4 + header_bytes, 0xff, ff_bytes);
+  dst[filler_bytes - 1] = 0x80;
+
+  return filler_bytes;
+}
+
+static guint
+gst_amlvenc_get_cbr_padding (GstAmlVEnc *encoder, guint out_size)
+{
+  guint64 expected_total_bytes;
+  guint64 actual_total_bytes;
+  guint64 denom;
+
+  if (encoder->rc_mode != 1 || encoder->bitrate == 0 || encoder->framerate <= 0)
+    return 0;
+
+  denom = (guint64) encoder->framerate * 8;
+  if (denom == 0)
+    return 0;
+
+  encoder->cbr_target_bytes_scaled += (guint64) encoder->bitrate * 1000;
+  expected_total_bytes = encoder->cbr_target_bytes_scaled / denom;
+  actual_total_bytes = encoder->cbr_emitted_bytes + out_size;
+
+  if (actual_total_bytes >= expected_total_bytes)
+    return 0;
+
+  return (guint) (expected_total_bytes - actual_total_bytes);
+}
+
 static gint
 gst_amlvenc_gop_pattern_delay_frames (gint gop_pattern)
 {
@@ -829,6 +891,8 @@ gst_amlvenc_init (GstAmlVEnc * encoder)
 
   encoder->u4_first_pts_index = 0;
   encoder->b_enable_dmallocator = TRUE;
+  encoder->cbr_target_bytes_scaled = 0;
+  encoder->cbr_emitted_bytes = 0;
 
   encoder->stopping = FALSE;
   encoder->sigint_source_id = 0;
@@ -893,6 +957,8 @@ gst_amlvenc_start (GstVideoEncoder * encoder)
   venc->v10conv.output_uv.fd = -1;
   venc->v10conv.output_y.fd_dup = -1;
   venc->v10conv.output_uv.fd_dup = -1;
+  venc->cbr_target_bytes_scaled = 0;
+  venc->cbr_emitted_bytes = 0;
   /* make sure that we have enough time for first DTS,
      this is probably overkill for most streams */
   gst_video_encoder_set_min_pts (encoder, GST_MSECOND * 30);
@@ -1045,6 +1111,8 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
 
   encoder->v10conv.enabled = (GST_VIDEO_INFO_FORMAT (info) == GST_VIDEO_FORMAT_ENCODED);
   encoder->output_counter = 0;
+  encoder->cbr_target_bytes_scaled = 0;
+  encoder->cbr_emitted_bytes = 0;
   encoder->bframe_base_pts = GST_CLOCK_TIME_NONE;
 
   /* VUI color signaling: read colorimetry from incoming caps and convert to
@@ -2233,15 +2301,38 @@ v10conv_pipeline_encode:
       meta.encoded_data_length_in_bytes);
 
   guint out_size = meta.encoded_data_length_in_bytes;
+  guint filler_size = gst_amlvenc_get_cbr_padding (encoder, out_size);
   /* NOTE: Library-level SPS/PPS prepend (mPrependSPSPPSToIDRFrames) handles
    * header insertion for I-frames.  Plugin-level prepend is no longer needed
    * now that delay frames are correctly suppressed in the library. */
 
+  if (filler_size > 0) {
+    guint min_filler = (encoder->codec.id == CODEC_ID_H265) ? 7 : 6;
+    if (filler_size < min_filler)
+      filler_size = 0;
+  }
+
   frame->output_buffer = gst_video_encoder_allocate_output_buffer(
-      GST_VIDEO_ENCODER(encoder), out_size);
+      GST_VIDEO_ENCODER(encoder), out_size + filler_size);
   gst_buffer_map(frame->output_buffer, &map, GST_MAP_WRITE);
   memcpy (map.data, encoder->codec.buf, meta.encoded_data_length_in_bytes);
+  if (filler_size > 0) {
+    guint written = gst_amlvenc_write_filler_nal (encoder->codec.id,
+        map.data + out_size, filler_size);
+    if (written != filler_size) {
+      GST_WARNING_OBJECT (encoder,
+          "failed to append filler NAL: requested=%u written=%u",
+          filler_size, written);
+      filler_size = written;
+    } else {
+      GST_LOG_OBJECT (encoder,
+          "appended filler NAL: frame=%u payload=%u filler=%u",
+          frame->system_frame_number, out_size, filler_size);
+    }
+  }
   gst_buffer_unmap (frame->output_buffer, &map);
+  if (encoder->rc_mode == 1)
+    encoder->cbr_emitted_bytes += out_size + filler_size;
 
   /*
   During encoder raw yuv file,and frame have no pts.
