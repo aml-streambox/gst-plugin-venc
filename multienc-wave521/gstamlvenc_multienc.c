@@ -48,6 +48,7 @@
 #include "imgproc.h"
 
 #include "gstamlionallocator.h"
+#include "p010_repack_vulkan.h"
 #include "yuv422_converter_gpu_gles.h"
 #include "yuv422_converter_vulkan.h"
 
@@ -346,6 +347,11 @@ gst_amlvenc_clear_v10conv_buffers (GstAmlVEnc * encoder)
   if (encoder->v10conv.gles_ctx) {
     yuv422_gpu_gles_cleanup(encoder->v10conv.gles_ctx);
     encoder->v10conv.gles_ctx = NULL;
+  }
+
+  if (encoder->v10conv.p010_repack_ctx) {
+    p010_repack_vulkan_cleanup(encoder->v10conv.p010_repack_ctx);
+    encoder->v10conv.p010_repack_ctx = NULL;
   }
 }
 
@@ -957,6 +963,7 @@ gst_amlvenc_start (GstVideoEncoder * encoder)
   venc->v10conv.output_uv.fd = -1;
   venc->v10conv.output_y.fd_dup = -1;
   venc->v10conv.output_uv.fd_dup = -1;
+  venc->v10conv.p010_repack_ctx = NULL;
   venc->cbr_target_bytes_scaled = 0;
   venc->cbr_emitted_bytes = 0;
   /* make sure that we have enough time for first DTS,
@@ -1133,6 +1140,20 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
       mc = 9;   /* BT.2020 non-constant luminance */
       GST_INFO_OBJECT (encoder,
           "v10conv path: no colorimetry in caps, defaulting to BT.2020 + PQ");
+    }
+
+    /* Non-v10conv path: when caps don't signal colorimetry, Wave521
+     * firmware emits a default Main10 VUI tagging the stream as
+     * BT.2020/PQ (HDR10).  For SDR BT.709 sources (e.g. HDMI RX), this
+     * causes downstream players to apply PQ→BT.709 conversion and shift
+     * colours.  Force BT.709 SDR when caps are silent. */
+    if (!encoder->v10conv.enabled && cp == 0 && tc == 0 && mc == 0) {
+      cp = 1;   /* BT.709 */
+      tc = 1;   /* BT.709 transfer */
+      mc = 1;   /* BT.709 matrix */
+      GST_INFO_OBJECT (encoder,
+          "no colorimetry in caps, defaulting to BT.709 SDR to override "
+          "firmware's HDR10 default VUI");
     }
 
     if (cp != 0 || tc != 0 || mc != 0) {
@@ -1727,7 +1748,7 @@ gst_amlvenc_finish (GstVideoEncoder * video_enc)
     memset(&inbuf_info, 0, sizeof(vl_buffer_info_t));
     inbuf_info.buf_type = DMA_TYPE;
     inbuf_info.buf_fmt = img_format_convert(GST_VIDEO_FORMAT_P010_10LE);
-    inbuf_info.buf_stride = info->width * 2;
+    inbuf_info.buf_stride = GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
     inbuf_info.buf_info.dma_info.shared_fd[0] = last_fd;
     inbuf_info.buf_info.dma_info.shared_fd[1] = -1;
     inbuf_info.buf_info.dma_info.shared_fd[2] = -1;
@@ -2079,6 +2100,113 @@ v10conv_pipeline_encode:
           } else {
             ui1_plane_num = 1;
           }
+
+          /* === DIAGNOSTIC: AML_TEST_MERGE_DMABUF ===
+           * When set, copy 2-plane P010 (Y+UV) into a single contiguous dmabuf
+           * and submit with num_planes=1. This hits the well-tested single-fd
+           * code path in vpuapi.c:951-961 (Y offset 0, UV at height*stride).
+           * Used to isolate whether 2-fd DMA import is the source of chroma
+           * corruption.
+           */
+          {
+            static const char *merge_env = NULL;
+            static int merge_checked = 0;
+            if (!merge_checked) {
+              merge_env = getenv("AML_TEST_MERGE_DMABUF");
+              merge_checked = 1;
+            }
+            if (merge_env && atoi(merge_env) == 1 && ui1_plane_num == 2) {
+              static const char *repack_env = NULL;
+              static int repack_checked = 0;
+              static int merge_fd = -1;
+              static void *merge_map = NULL;
+              static gsize merge_size = 0;
+              static int merge_w = 0, merge_h = 0;
+              int w = info->width, h = info->height;
+              /* P010 stride = width * 2. Y = h*stride, UV = (h/2)*stride. */
+              int stride = w * 2;
+              gsize need = (gsize)stride * h + (gsize)stride * (h / 2);
+
+              if (!repack_checked) {
+                repack_env = getenv("AML_TEST_WAVE_SWAP_P010");
+                repack_checked = 1;
+              }
+
+              if (merge_fd < 0 || merge_w != w || merge_h != h) {
+                if (merge_map) { munmap(merge_map, merge_size); merge_map = NULL; }
+                if (merge_fd >= 0) { close(merge_fd); merge_fd = -1; }
+                merge_fd = gst_amlvenc_alloc_dma_heap_fd(need);
+                if (merge_fd < 0) {
+                  GST_ERROR_OBJECT(encoder, "AML_TEST_MERGE_DMABUF: alloc fail size=%zu", need);
+                } else {
+                  merge_map = mmap(NULL, need, PROT_READ|PROT_WRITE, MAP_SHARED, merge_fd, 0);
+                  if (merge_map == MAP_FAILED) {
+                    GST_ERROR_OBJECT(encoder, "AML_TEST_MERGE_DMABUF: mmap fail");
+                    close(merge_fd); merge_fd = -1; merge_map = NULL;
+                  } else {
+                    merge_size = need;
+                    merge_w = w; merge_h = h;
+                    GST_WARNING_OBJECT(encoder,
+                        "AML_TEST_MERGE_DMABUF: allocated merge buf fd=%d size=%zu %dx%d stride=%d",
+                        merge_fd, need, w, h, stride);
+                  }
+                }
+              }
+
+              if (merge_fd >= 0 && merge_map) {
+                /* Copy Y from encoder->fd[0] */
+                gsize y_size = (gsize)stride * h;
+                gsize uv_size = (gsize)stride * (h / 2);
+                void *src_y = mmap(NULL, y_size, PROT_READ, MAP_SHARED, encoder->fd[0], 0);
+                void *src_uv = mmap(NULL, uv_size, PROT_READ, MAP_SHARED, encoder->fd[1], 0);
+                if (src_y != MAP_FAILED && src_uv != MAP_FAILED) {
+                  struct dma_buf_sync s0 = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+                  struct dma_buf_sync s1 = { .flags = DMA_BUF_SYNC_END   | DMA_BUF_SYNC_READ };
+                  struct dma_buf_sync d0 = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_WRITE };
+                  struct dma_buf_sync d1 = { .flags = DMA_BUF_SYNC_END   | DMA_BUF_SYNC_WRITE };
+                  ioctl(encoder->fd[0], DMA_BUF_IOCTL_SYNC, &s0);
+                  ioctl(encoder->fd[1], DMA_BUF_IOCTL_SYNC, &s0);
+                  ioctl(merge_fd, DMA_BUF_IOCTL_SYNC, &d0);
+                  memcpy(merge_map, src_y, y_size);
+                  memcpy((char*)merge_map + y_size, src_uv, uv_size);
+                  ioctl(merge_fd, DMA_BUF_IOCTL_SYNC, &d1);
+                  ioctl(encoder->fd[0], DMA_BUF_IOCTL_SYNC, &s1);
+                  ioctl(encoder->fd[1], DMA_BUF_IOCTL_SYNC, &s1);
+                  munmap(src_y, y_size);
+                  munmap(src_uv, uv_size);
+
+                  /* Close original fd1 handle (fd0 gets reused by caller's gst_memory_unref above;
+                   * but we've already stored it. Just overwrite with merge fd.) */
+                  encoder->fd[0] = merge_fd;
+                  encoder->fd[1] = -1;
+                  ui1_plane_num = 1;
+                  if (repack_env && atoi(repack_env) == 1) {
+                    if (!encoder->v10conv.p010_repack_ctx)
+                      encoder->v10conv.p010_repack_ctx = p010_repack_vulkan_init();
+                    if (!encoder->v10conv.p010_repack_ctx) {
+                      GST_ERROR_OBJECT(encoder, "AML_TEST_WAVE_SWAP_P010: init failed");
+                    } else if (p010_repack_vulkan_convert_inplace(
+                                   encoder->v10conv.p010_repack_ctx,
+                                   merge_fd, w, h) != 0) {
+                      GST_ERROR_OBJECT(encoder,
+                          "AML_TEST_WAVE_SWAP_P010: repack failed (%s)",
+                          p010_repack_vulkan_last_error(encoder->v10conv.p010_repack_ctx));
+                    } else {
+                      GST_WARNING_OBJECT(encoder,
+                          "AML_TEST_WAVE_SWAP_P010: repacked merged P010 dmabuf fd=%d",
+                          merge_fd);
+                    }
+                  }
+                  GST_WARNING_OBJECT(encoder,
+                      "AML_TEST_MERGE_DMABUF: merged to single fd=%d planes=1", merge_fd);
+                } else {
+                  if (src_y != MAP_FAILED) munmap(src_y, y_size);
+                  if (src_uv != MAP_FAILED) munmap(src_uv, uv_size);
+                  GST_ERROR_OBJECT(encoder, "AML_TEST_MERGE_DMABUF: src mmap fail");
+                }
+              }
+            }
+          }
           break;
           }
       default: //hanle I420/YV12/RGB
@@ -2166,7 +2294,16 @@ v10conv_pipeline_encode:
   memset(&inbuf_info, 0, sizeof(vl_buffer_info_t));
   inbuf_info.buf_type = DMA_TYPE;
   inbuf_info.buf_fmt = img_format_convert (submit_format);
-  inbuf_info.buf_stride = (submit_format == GST_VIDEO_FORMAT_P010_10LE) ? info->width * 2 : GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
+  if (submit_format == GST_VIDEO_FORMAT_P010_10LE) {
+    GstVideoMeta *vmeta = gst_buffer_get_video_meta (frame->input_buffer);
+
+    if (vmeta && vmeta->n_planes > 0 && vmeta->stride[0] > 0)
+      inbuf_info.buf_stride = vmeta->stride[0];
+    else
+      inbuf_info.buf_stride = GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
+  } else {
+    inbuf_info.buf_stride = GST_VIDEO_INFO_PLANE_STRIDE (info, 0);
+  }
   if (inbuf_info.buf_stride <= 0)
     inbuf_info.buf_stride = info->width;
   inbuf_info.buf_info.dma_info.shared_fd[0] = encoder->fd[0];

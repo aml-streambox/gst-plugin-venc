@@ -20,6 +20,7 @@
 /* Forward declarations for per-instance GPU converter contexts */
 typedef struct VulkanCtx VulkanCtx;
 typedef struct GpuCtx GpuCtx;
+typedef struct P010RepackCtx P010RepackCtx;
 
 #ifdef HAVE_STDINT_H
 #include <stdint.h>
@@ -84,6 +85,7 @@ struct _GstAmlVEnc
     gboolean pipeline_primed; /* TRUE after first frame's GPU work submitted */
     VulkanCtx *vulkan_ctx;  /* per-instance Vulkan converter (NULL = not initialized) */
     GpuCtx *gles_ctx;      /* per-instance GLES converter (NULL = not initialized) */
+    P010RepackCtx *p010_repack_ctx; /* test-only P010->Wave repack ctx */
   } v10conv;
 
   GstAllocator *dmabuf_alloc;

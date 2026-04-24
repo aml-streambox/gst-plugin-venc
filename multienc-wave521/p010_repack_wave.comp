@@ -1,0 +1,29 @@
+#version 450
+
+layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer P010Buffer {
+    uint data[];
+} p010_buffer;
+
+layout(push_constant) uniform Params {
+    uint total_words;
+} params;
+
+uint wave_swap_from_standard_p010(uint packed_sample)
+{
+    uint v10 = packed_sample >> 6u;
+    return ((v10 & 0xFFu) << 8) | ((v10 >> 8) & 0x3u);
+}
+
+void main()
+{
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= params.total_words)
+        return;
+
+    uint packed = p010_buffer.data[idx];
+    uint lo = wave_swap_from_standard_p010(packed & 0xFFFFu);
+    uint hi = wave_swap_from_standard_p010((packed >> 16) & 0xFFFFu);
+    p010_buffer.data[idx] = lo | (hi << 16);
+}
