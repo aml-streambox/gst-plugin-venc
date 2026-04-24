@@ -1253,6 +1253,19 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   qp_tbl.qp_B_min = encoder->min_qp_b;
   qp_tbl.qp_B_max = encoder->max_qp_b;
 
+  {
+    unsigned char *raw = (unsigned char *)&encode_info;
+    gchar hex[2048];
+    int off = 0;
+    for (int i = 0; i < (int)sizeof(encode_info) && off < (int)sizeof(hex) - 4; i++)
+      off += snprintf(hex + off, sizeof(hex) - off, "%02x ", raw[i]);
+    GST_WARNING_OBJECT (encoder,
+        "ENCODE_INFO RAW[%u]: %s", (unsigned)sizeof(encode_info), hex);
+    GST_WARNING_OBJECT (encoder,
+        "ENCODE_INFO FIELDS: w=%d h=%d fps=%d br=%d gop=%d img_fmt=%d bit_depth(ignored_here)",
+        encode_info.width, encode_info.height, encode_info.frame_rate,
+        encode_info.bit_rate, encode_info.gop, encode_info.img_format);
+  }
   encoder->codec.handle = vl_multi_encoder_init(encoder->codec.id, encode_info, &qp_tbl);
 
   if (encoder->codec.handle == 0) {
@@ -2323,6 +2336,29 @@ v10conv_pipeline_encode:
       inbuf_info.buf_info.dma_info.shared_fd[0],
       inbuf_info.buf_info.dma_info.shared_fd[1],
       info->width, info->height);
+  {
+    GstVideoMeta *vm = gst_buffer_get_video_meta (frame->input_buffer);
+    guint n_mem_now = gst_buffer_n_memory (frame->input_buffer);
+    GST_WARNING_OBJECT (encoder,
+        "SUBMIT META: n_mem=%u vmeta=%p n_planes=%u stride=[%d,%d,%d] offset=[%zu,%zu,%zu]",
+        n_mem_now, vm,
+        vm ? vm->n_planes : 0,
+        vm ? vm->stride[0] : -1,
+        vm ? vm->stride[1] : -1,
+        vm ? vm->stride[2] : -1,
+        vm ? (size_t)vm->offset[0] : (size_t)0,
+        vm ? (size_t)vm->offset[1] : (size_t)0,
+        vm ? (size_t)vm->offset[2] : (size_t)0);
+    for (guint i = 0; i < n_mem_now && i < 3; i++) {
+      GstMemory *m = gst_buffer_peek_memory (frame->input_buffer, i);
+      int fd_i = -1;
+      if (gst_is_dmabuf_memory (m)) fd_i = gst_dmabuf_memory_get_fd (m);
+      GST_WARNING_OBJECT (encoder,
+          "  mem[%u]: gstmem=%p size=%zu offset=%zu fd=%d",
+          i, m, m ? gst_memory_get_sizes(m, NULL, NULL) : 0,
+          m ? (size_t)0 : (size_t)0, fd_i);
+    }
+  }
 
   /* Last chance to bail before entering the blocking encoder call */
   if (G_UNLIKELY (encoder->stopping)) {
@@ -2363,6 +2399,15 @@ v10conv_pipeline_encode:
     if (frame)
       gst_video_codec_frame_unref (frame);
     return GST_FLOW_FLUSHING;
+  }
+  {
+    unsigned char *raw = (unsigned char *)&inbuf_info;
+    gchar hex[256];
+    int off = 0;
+    for (int i = 0; i < (int)sizeof(inbuf_info); i++)
+      off += snprintf(hex + off, sizeof(hex) - off, "%02x ", raw[i]);
+    GST_WARNING_OBJECT (encoder,
+        "INBUF_INFO RAW[%u]: %s", (unsigned)sizeof(inbuf_info), hex);
   }
   encoding_metadata_t meta =
       vl_multi_encoder_encode(encoder->codec.handle, frame_type,
