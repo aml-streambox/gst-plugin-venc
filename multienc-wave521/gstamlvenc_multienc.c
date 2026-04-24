@@ -1089,6 +1089,13 @@ gst_amlvenc_init_encoder (GstAmlVEnc * encoder)
   encode_info.width = info->width;
   encode_info.height = info->height;
   encode_info.frame_rate = encoder->framerate;
+  if (info->fps_n > 0 && info->fps_d > 0) {
+    encode_info.frame_rate = info->fps_n / info->fps_d;
+    if (encode_info.frame_rate <= 0)
+      encode_info.frame_rate = encoder->framerate;
+    else
+      encoder->framerate = encode_info.frame_rate;
+  }
   encode_info.bit_rate = encoder->bitrate * 1000;
   encode_info.gop = encoder->gop;
   encode_info.img_format = img_format_convert(GST_VIDEO_INFO_FORMAT(info));
@@ -2101,11 +2108,9 @@ v10conv_pipeline_encode:
             ui1_plane_num = 1;
           }
 
-          /* P010 DMA-buf input is delivered as separate Y and UV planes, but the
-           * Wave521 path behaves correctly only when the source is submitted as a
-           * single contiguous buffer. Merge P010 Y+UV into one dmabuf here and
-           * submit it as num_planes=1. Keep AML_TEST_MERGE_DMABUF as an opt-in for
-           * other formats while making P010 use the merged path by default. */
+          /* Keep P010 as multi-plane dma-buf input by default.  If needed,
+           * AML_TEST_MERGE_DMABUF can still force the legacy merge path for
+           * debugging. */
           {
             static const char *merge_env = NULL;
             static int merge_checked = 0;
@@ -2113,8 +2118,7 @@ v10conv_pipeline_encode:
               merge_env = getenv("AML_TEST_MERGE_DMABUF");
               merge_checked = 1;
             }
-            if (((submit_format == GST_VIDEO_FORMAT_P010_10LE && ui1_plane_num == 2) ||
-                 (merge_env && atoi(merge_env) == 1 && ui1_plane_num == 2))) {
+            if (merge_env && atoi(merge_env) == 1 && ui1_plane_num == 2) {
               static const char *repack_env = NULL;
               static int repack_checked = 0;
               static int merge_fd = -1;
@@ -2333,10 +2337,13 @@ v10conv_pipeline_encode:
    * (via vf_put → VIDIOC_QBUF) while the Wave521 VPU is still reading,
    * causing a kernel crash.  The SYNC_START tells the exporter we are
    * actively reading; SYNC_END (after encode) releases that claim. */
-  int sync_input_fd = encoder->fd[0];
+  int sync_input_fds[3] = { encoder->fd[0], encoder->fd[1], encoder->fd[2] };
   struct dma_buf_sync dbs_start = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
   struct dma_buf_sync dbs_end   = { .flags = DMA_BUF_SYNC_END   | DMA_BUF_SYNC_READ };
-  if (sync_input_fd >= 0) {
+  for (guint i = 0; i < MIN ((guint) ui1_plane_num, (guint) G_N_ELEMENTS (sync_input_fds)); i++) {
+    int sync_input_fd = sync_input_fds[i];
+    if (sync_input_fd < 0)
+      continue;
     int sr = ioctl(sync_input_fd, DMA_BUF_IOCTL_SYNC, &dbs_start);
     if (sr < 0) {
       GST_WARNING_OBJECT (encoder, "DMA_BUF_SYNC_START failed on fd %d: %s",
@@ -2348,8 +2355,10 @@ v10conv_pipeline_encode:
   g_mutex_lock (&encoder->encoder_lock);
   if (G_UNLIKELY (encoder->codec.handle == 0)) {
     g_mutex_unlock (&encoder->encoder_lock);
-    if (sync_input_fd >= 0)
-      ioctl(sync_input_fd, DMA_BUF_IOCTL_SYNC, &dbs_end);
+    for (guint i = 0; i < MIN ((guint) ui1_plane_num, (guint) G_N_ELEMENTS (sync_input_fds)); i++) {
+      if (sync_input_fds[i] >= 0)
+        ioctl(sync_input_fds[i], DMA_BUF_IOCTL_SYNC, &dbs_end);
+    }
     GST_WARNING_OBJECT (encoder, "encode_frame: codec handle destroyed while waiting for lock");
     if (frame)
       gst_video_codec_frame_unref (frame);
@@ -2361,7 +2370,10 @@ v10conv_pipeline_encode:
   g_mutex_unlock (&encoder->encoder_lock);
 
   /* Release DMA-buf read access — exporter may now recycle the buffer */
-  if (sync_input_fd >= 0) {
+  for (guint i = 0; i < MIN ((guint) ui1_plane_num, (guint) G_N_ELEMENTS (sync_input_fds)); i++) {
+    int sync_input_fd = sync_input_fds[i];
+    if (sync_input_fd < 0)
+      continue;
     int er = ioctl(sync_input_fd, DMA_BUF_IOCTL_SYNC, &dbs_end);
     if (er < 0) {
       GST_WARNING_OBJECT (encoder, "DMA_BUF_SYNC_END failed on fd %d: %s",
