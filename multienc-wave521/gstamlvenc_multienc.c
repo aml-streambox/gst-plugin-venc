@@ -2101,13 +2101,11 @@ v10conv_pipeline_encode:
             ui1_plane_num = 1;
           }
 
-          /* === DIAGNOSTIC: AML_TEST_MERGE_DMABUF ===
-           * When set, copy 2-plane P010 (Y+UV) into a single contiguous dmabuf
-           * and submit with num_planes=1. This hits the well-tested single-fd
-           * code path in vpuapi.c:951-961 (Y offset 0, UV at height*stride).
-           * Used to isolate whether 2-fd DMA import is the source of chroma
-           * corruption.
-           */
+          /* P010 DMA-buf input is delivered as separate Y and UV planes, but the
+           * Wave521 path behaves correctly only when the source is submitted as a
+           * single contiguous buffer. Merge P010 Y+UV into one dmabuf here and
+           * submit it as num_planes=1. Keep AML_TEST_MERGE_DMABUF as an opt-in for
+           * other formats while making P010 use the merged path by default. */
           {
             static const char *merge_env = NULL;
             static int merge_checked = 0;
@@ -2115,7 +2113,8 @@ v10conv_pipeline_encode:
               merge_env = getenv("AML_TEST_MERGE_DMABUF");
               merge_checked = 1;
             }
-            if (merge_env && atoi(merge_env) == 1 && ui1_plane_num == 2) {
+            if (((submit_format == GST_VIDEO_FORMAT_P010_10LE && ui1_plane_num == 2) ||
+                 (merge_env && atoi(merge_env) == 1 && ui1_plane_num == 2))) {
               static const char *repack_env = NULL;
               static int repack_checked = 0;
               static int merge_fd = -1;
@@ -2123,8 +2122,9 @@ v10conv_pipeline_encode:
               static gsize merge_size = 0;
               static int merge_w = 0, merge_h = 0;
               int w = info->width, h = info->height;
-              /* P010 stride = width * 2. Y = h*stride, UV = (h/2)*stride. */
-              int stride = w * 2;
+              GstVideoMeta *vmeta = gst_buffer_get_video_meta (frame->input_buffer);
+              int stride = (vmeta && vmeta->n_planes > 0 && vmeta->stride[0] > 0) ?
+                  vmeta->stride[0] : (w * 2);
               gsize need = (gsize)stride * h + (gsize)stride * (h / 2);
 
               if (!repack_checked) {
